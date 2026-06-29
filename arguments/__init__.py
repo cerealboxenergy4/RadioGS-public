@@ -102,7 +102,16 @@ class PipelineParams(ParamGroup):
         self.diffuse_sample_num = 256
         self.specular_sample_num = 0
         self.light_t_min = 0.05
-        
+
+        # ---- single-layer ironing (Part 2 / RadioGS) ----
+        # Super-Gaussian footprint order for BOTH the rasterizer and the 2D Gaussian ray tracer
+        # (2.0 == standard Gaussian, bit-identical to stock RadioGS). Set to the order the ironed
+        # geometry was trained at (e.g. 3.0) so the tracer "sees" the sharpened, thinner shell.
+        self.super_gaussian_order = 2.0
+        # First-hit trace mode: terminate each traced ray at its first accepted surfel (k_eff := 1).
+        # The literal realization of the single-layer north-star; an eval-time extreme. Default off.
+        self.first_hit_only = False
+
         self.wo_indirect = False
         self.wo_indirect_relight = False
         self.detach_indirect = False
@@ -205,11 +214,23 @@ class OptimizationParams(ParamGroup):
         self.normal_smooth_from_iter = 0
         self.normal_smooth_until_iter = 18000
         self.init_until_iter = 2000
-        self.normal_prop_until_iter = 10_000 
+        self.normal_prop_until_iter = 10_000
         self.normal_prop_interval = 1000
         self.opac_lr0_interval = 200
         self.densification_interval_when_prop = 500
-        
+
+        # ---- stage-2 trace-ray k_eff loss (single-layer; analog of stage-1 lambda_single) ----
+        self.lambda_keff = 0.0              # 0 = off; turn on to penalize multi-layer secondary rays
+        self.keff_warmup_iters = 0          # iters before the loss switches on
+        self.keff_ramp_iters = 1_000        # linear ramp-in length
+        self.keff_until_iter = 0            # 0 = hold to end (no decay)
+        self.keff_decay_iters = 0
+        self.keff_alpha_thresh = 0.5        # a ray counts as a hit when trace_alpha > this
+        self.keff_interval = 1              # apply every N iterations (cost knob)
+        self.keff_n_surfels = 2048          # random surfels sampled as ray origins per application
+        self.keff_n_dirs = 8                # hemisphere directions sampled per surfel
+        self.keff_offset_scale = 3.0        # origin offset = scale * mean surfel scale, along +normal
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

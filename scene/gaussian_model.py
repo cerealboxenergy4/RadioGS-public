@@ -780,8 +780,10 @@ class GaussianModel:
             normals_raw, positive = flip_align_view(normals_raw, means3D - camera_center)
         normals = safe_normalize(normals_raw)
         
-        if not detach_orientation: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling)
-        else: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o.detach(), rays_d.detach(), means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals.detach(), features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling)
+        sgo = getattr(self, "super_gaussian_order", 2.0)  # single-layer: ironed footprint order for the tracer
+        fho = getattr(self, "first_hit_only", False)      # single-layer: first-hit trace mode (k_eff := 1)
+        if not detach_orientation: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
+        else: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o.detach(), rays_d.detach(), means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals.detach(), features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
         
         alpha_ = alpha[..., None]
         color = torch.where(alpha_ < 1 - self.gaussian_tracer.transmittance_min, color, color / alpha_)

@@ -193,16 +193,16 @@ public:
     void gaussian_trace_forward(
 		uint32_t n_elements, const int S, const glm::vec3* rays_o, const glm::vec3* rays_d, const int* gs_idxs, 
 		const glm::vec3* means3D, const float* opacity, const glm::vec3* ru, const glm::vec3* rv, const glm::vec3* normals, const float* features, const glm::vec3* shs, 
-		glm::vec3* color, glm::vec3* normal, float* feature, float* depth, float* alpha, 
-		const float alpha_min, const float transmittance_min, const int deg, const int max_coeffs, const bool back_culling, cudaStream_t stream
+		glm::vec3* color, glm::vec3* normal, float* feature, float* depth, float* alpha, float* alpha_m2,
+		const float alpha_min, const float transmittance_min, const int deg, const int max_coeffs, const bool back_culling, const float super_gaussian_order, const bool first_hit_only, unsigned long long* counters, cudaStream_t stream
 	) override {
         m_optix.gaussiantrace_forward->invoke(
 			{
-				rays_o, rays_d, gs_idxs, 
-				means3D, opacity, ru, rv, normals, features, shs, 
-				color, normal, feature, depth, alpha, 
-				alpha_min, transmittance_min, deg, max_coeffs, S, back_culling, m_optix.gas->handle()
-			}, 
+				rays_o, rays_d, gs_idxs,
+				means3D, opacity, ru, rv, normals, features, shs,
+				color, normal, feature, depth, alpha, alpha_m2,
+				alpha_min, transmittance_min, deg, max_coeffs, S, back_culling, super_gaussian_order, first_hit_only, counters, m_optix.gas->handle()
+			},
 			{n_elements, 1, 1}, 
 			stream);
     }
@@ -210,20 +210,20 @@ public:
 	void gaussian_trace_backward(
 		uint32_t n_elements, const int S, const glm::vec3* rays_o, const glm::vec3* rays_d, const int* gs_idxs, 
 		const glm::vec3* means3D, const float* opacity, const glm::vec3* ru, const glm::vec3* rv, const glm::vec3* normals, const float* features, const glm::vec3* shs, 
-		const glm::vec3* color, const glm::vec3* normal, const float* feature, const float* depth, const float* alpha, 
-		glm::vec3* grad_rays_o, glm::vec3* grad_rays_d, glm::vec3* grad_means3D, float* grad_opacity, glm::vec3* grad_ru, glm::vec3* grad_rv, glm::vec3* grad_normals, float* grad_features, glm::vec3* grad_shs, 
-        const glm::vec3* grad_color, const glm::vec3* grad_normal, const float* grad_feature, const float* grad_depth, const float* grad_alpha,
-		const float alpha_min, const float transmittance_min, const int deg, const int max_coeffs, const bool back_culling, cudaStream_t stream
+		const glm::vec3* color, const glm::vec3* normal, const float* feature, const float* depth, const float* alpha, const float* alpha_m2,
+		glm::vec3* grad_rays_o, glm::vec3* grad_rays_d, glm::vec3* grad_means3D, float* grad_opacity, glm::vec3* grad_ru, glm::vec3* grad_rv, glm::vec3* grad_normals, float* grad_features, glm::vec3* grad_shs,
+        const glm::vec3* grad_color, const glm::vec3* grad_normal, const float* grad_feature, const float* grad_depth, const float* grad_alpha, const float* grad_alpha_m2,
+		const float alpha_min, const float transmittance_min, const int deg, const int max_coeffs, const bool back_culling, const float super_gaussian_order, cudaStream_t stream
 	) override {
         m_optix.gaussiantrace_backward->invoke(
 			{
-				rays_o, rays_d, gs_idxs, 
-				means3D, opacity, ru, rv, normals, features, shs, 
-				color, normal, feature, depth, alpha, 
-				grad_rays_o, grad_rays_d, grad_means3D, grad_opacity, grad_ru, grad_rv, grad_normals, grad_features, grad_shs, 
-				grad_color, grad_normal, grad_feature, grad_depth, grad_alpha,
-				alpha_min, transmittance_min, deg, max_coeffs, S, back_culling, m_optix.gas->handle()
-			}, 
+				rays_o, rays_d, gs_idxs,
+				means3D, opacity, ru, rv, normals, features, shs,
+				color, normal, feature, depth, alpha, alpha_m2,
+				grad_rays_o, grad_rays_d, grad_means3D, grad_opacity, grad_ru, grad_rv, grad_normals, grad_features, grad_shs,
+				grad_color, grad_normal, grad_feature, grad_depth, grad_alpha, grad_alpha_m2,
+				alpha_min, transmittance_min, deg, max_coeffs, S, back_culling, super_gaussian_order, m_optix.gas->handle()
+			},
 			{n_elements, 1, 1}, 
 			stream);
     }

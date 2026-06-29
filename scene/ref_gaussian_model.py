@@ -643,6 +643,44 @@ class RefGaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+    # ---- single-layer visibility prune (ported from single-layer-surfel Part 1) ----
+    def reset_contribution_stats(self):
+        n = self.get_xyz.shape[0]
+        self.contribution_accum = torch.zeros(n, device="cuda")
+        self.contribution_view_count = torch.zeros(n, device="cuda")
+
+    def add_contribution_stats(self, surfel_contrib, visibility_filter=None):
+        if getattr(self, "contribution_accum", torch.empty(0)).shape[0] != self.get_xyz.shape[0]:
+            self.reset_contribution_stats()
+        self.contribution_accum = torch.maximum(self.contribution_accum, surfel_contrib.detach())
+        if visibility_filter is not None:
+            self.contribution_view_count[visibility_filter] += 1
+
+    def visibility_prune(self, contribution_threshold, min_visible_views=1, max_prune_fraction=0.0):
+        """Prune Gaussians whose max per-pixel contribution across all seen views stays below
+        contribution_threshold (seen in >= min_visible_views), capped at max_prune_fraction of points."""
+        if getattr(self, "contribution_accum", torch.empty(0)).shape[0] != self.get_xyz.shape[0]:
+            self.reset_contribution_stats()
+            return 0
+        n = self.get_xyz.shape[0]
+        eligible = self.contribution_view_count >= min_visible_views
+        candidate = eligible & (self.contribution_accum < contribution_threshold)
+        if max_prune_fraction and candidate.sum() > 0:
+            cap = max(1, int(n * max_prune_fraction))
+            if int(candidate.sum().item()) > cap:
+                idx = torch.nonzero(candidate, as_tuple=False).flatten()
+                keep = self.contribution_accum[idx].argsort()[:cap]  # prune the lowest-contribution first
+                new_mask = torch.zeros_like(candidate)
+                new_mask[idx[keep]] = True
+                candidate = new_mask
+        pruned = int(candidate.sum().item())
+        if pruned > 0:
+            self.prune_points(candidate)
+            self.reset_contribution_stats()  # sizes changed; rebuild
+        print(f"[vprune] thr={contribution_threshold} eligible={int(eligible.sum().item())} "
+              f"pruned={pruned} -> {n - pruned}/{n} kept", flush=True)
+        return pruned
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import calculate_loss, l1_loss, calculate_loss2, calculate_loss4
+from utils.loss_utils import calculate_loss, l1_loss, calculate_loss2, calculate_loss4, scheduled_weight, single_layer_loss
 from gaussian_renderer import render_surfel, render_initial, render_volume
 import sys
 from scene import Scene, RefGaussianModel as GaussianModel
@@ -152,7 +152,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             metallics = gaussians.get_metallic
             metallic_msk_loss = metallics[get_outside_msk()].mean()
             total_loss += METALLIC_MSK_LOSS_W * metallic_msk_loss
-        
+
+        # ---- single-layer ironing loss (N_eff) ----
+        neff_for_log = 0.0
+        if 'rend_alpha_m2' in render_pkg:
+            single_w = scheduled_weight(opt.lambda_single, iteration, opt.single_warmup_iters,
+                                        opt.single_ramp_iters, opt.single_until_iter, opt.single_decay_iters)
+            if single_w > 0.0:
+                single_raw, neff_for_log, _ = single_layer_loss(
+                    render_pkg['rend_alpha'], render_pkg['rend_alpha_m2'], opt.single_alpha_thresh)
+                total_loss = total_loss + single_w * single_raw
+
         total_loss.backward()
 
         iter_end.record()
@@ -173,6 +183,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Distort": f"{ema_dist_for_log:.{5}f}",
                     "Normal": f"{ema_normal_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}",
+                    "Neff": f"{float(neff_for_log):.3f}",
                     "PSNR-train": f"{ema_psnr_for_log:.{4}f}",
                     "PSNR-test": f"{psnr_test:.{4}f}"
                 }
@@ -191,7 +202,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if iteration in testing_iterations:
                 psnr_test = evaluate_psnr(scene, render, {"pipe": pipe, "bg_color": background, "opt": opt, "srgb":pipe.srgb}, iteration)
-                
+
+            # single-layer: accumulate per-Gaussian contribution BEFORE densify/prune changes the
+            # point count (surfel_contrib is sized to the render-time count); ungated by densify_until
+            # so it also feeds the post-densify visibility prune.
+            if opt.visibility_prune_interval > 0 and 'surfel_contrib' in render_pkg:
+                gaussians.add_contribution_stats(render_pkg['surfel_contrib'], visibility_filter)
+
             # Densification
             if iteration < opt.densify_until_iter and iteration != opt.volume_render_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
@@ -236,7 +253,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.reset_scale(exclusive_msk=outside_msk)
                         if opt.opac_lr0_interval > 0 and iteration != opt.normal_prop_until_iter :
                             gaussians.set_opacity_lr(0.0)
-                
+
+            # single-layer: visibility prune — kept OUTSIDE the densify_until_iter guard so it acts on
+            # settled, normal-propagated geometry. No densify runs past densify_until_iter, so the point
+            # count is stable here and contribution_accum (sized at accumulation time above) matches get_xyz.
+            if (opt.visibility_prune_interval > 0
+                    and opt.visibility_prune_from_iter <= iteration <= opt.visibility_prune_until_iter
+                    and iteration % opt.visibility_prune_interval == 0):
+                gaussians.visibility_prune(opt.visibility_prune_thresh, 1, opt.visibility_prune_max_fraction)
+
             if (iteration >= opt.indirect_from_iter and iteration % MESH_EXTRACT_INTERVAL == 0) or iteration == (opt.indirect_from_iter):
                 if not HAS_RESET0:
                     gaussExtractor.reconstruction(scene.getTrainCameras())

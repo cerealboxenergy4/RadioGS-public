@@ -62,6 +62,7 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
+        self.init_ply = ""   # if set, overrides dataset points3d.ply with this EDGS/custom PLY
 
         # Device Settings
         self.data_device = "cuda"
@@ -93,6 +94,8 @@ class PipelineParams(ParamGroup):
         # Debugging
         self.depth_ratio = 0.0
         self.debug = False
+        # single-layer: super-Gaussian footprint order for the rasterizer (2.0 == standard Gaussian)
+        self.super_gaussian_order = 2.0
 
         # SRGB Transformation
         self.srgb = False
@@ -130,6 +133,20 @@ class OptimizationParams(ParamGroup):
         self.lambda_normal_smooth = 0.0
         self.lambda_depth_smooth = 0.0
         self.lambda_mask_entropy = 0.0
+
+        # ---- single-layer ironing (ported from single-layer-surfel Part 1) ----
+        self.lambda_single = 0.0            # 0 = ironing off; ironed point e.g. 0.004
+        self.single_warmup_iters = 15_000   # off until here (let geometry/normals settle first)
+        self.single_ramp_iters = 3_000
+        self.single_until_iter = 0          # 0 = hold to end (no decay)
+        self.single_decay_iters = 0
+        self.single_alpha_thresh = 0.5
+        self.visibility_prune_interval = 0  # 0 = off
+        self.visibility_prune_from_iter = 15_000
+        self.visibility_prune_until_iter = 30_000
+        self.visibility_prune_thresh = 0.05
+        self.visibility_prune_max_fraction = 0.0
+
         self.lambda_base_color_smooth = 0.0
         self.lambda_roughness_smooth = 0.0
         self.lambda_metallic_smooth = 0.0

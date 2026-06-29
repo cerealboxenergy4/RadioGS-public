@@ -53,7 +53,12 @@ if __name__ == '__main__':
     # gaussians = GaussianModel(3)
     # 
     gaussians = RadioGSModel(3)
-    
+    gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
+    gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
+    # single-layer: turn on trace-cost instrumentation (mean k_eff = accepted hits / ray).
+    gaussians.gaussian_tracer.collect_counters = True
+    gaussians.gaussian_tracer.reset_counters()
+
     if args.iteration < 0:
         loaded_iter = searchForMaxIteration(os.path.join(args.model_path, "point_cloud"))
     else:
@@ -224,6 +229,16 @@ if __name__ == '__main__':
     results_dict["ssim_pbr_avg"] = np.mean([results_dict[task_name]["ssim_pbr"] for task_name in task_names])
     results_dict["lpips_pbr_avg"] = np.mean([results_dict[task_name]["lpips_pbr"] for task_name in task_names])
     print("\nEvaluating AVG: PSNR_PBR {: .4f} SSIM_PBR {: .4f} LPIPS_PBR {: .4f}".format(results_dict["psnr_pbr_avg"], results_dict["ssim_pbr_avg"], results_dict["lpips_pbr_avg"]))
+    # single-layer: report trace-cost spine (the Part-2 cost axis / north-star number).
+    cand_per_ray, keff, n_rays = gaussians.gaussian_tracer.read_counters()
+    results_dict["trace_cost"] = {"k_eff": keff, "candidates_per_ray": cand_per_ray, "n_rays": n_rays,
+                                  "first_hit_only": bool(gaussians.first_hit_only),
+                                  "super_gaussian_order": float(gaussians.super_gaussian_order),
+                                  "n_surfels": int(gaussians.get_xyz.shape[0])}
+    print("[trace-cost] k_eff(mean accepted hits/ray)={:.4f}  candidates/ray={:.4f}  rays={}  "
+          "first_hit_only={}  order={}  N_surfel={}".format(
+          keff, cand_per_ray, n_rays, gaussians.first_hit_only, gaussians.super_gaussian_order,
+          gaussians.get_xyz.shape[0]))
     with open(os.path.join(results_dir, "relighting_results.json"), "w") as f:
         json.dump(results_dict, f, indent=4)
     print("Results saved to", os.path.join(results_dir, "relighting_results.json"))

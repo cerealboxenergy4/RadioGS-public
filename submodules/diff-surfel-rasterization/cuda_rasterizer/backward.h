@@ -44,7 +44,8 @@ namespace BACKWARD
 		float* dL_dnormal3D,
 		float* dL_dopacity,
 		float* dL_dcolors,
-		float* dL_dfeature // //
+		float* dL_dfeature, // //
+		float super_gaussian_order
 		);
 
 	void preprocess(

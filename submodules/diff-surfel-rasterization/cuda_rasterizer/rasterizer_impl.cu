@@ -221,6 +221,8 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	float* out_feature, // //
 	float* out_others,
+	float* surfel_contrib, // single-layer: per-Gaussian max contribution (vis-prune)
+	float super_gaussian_order, // single-layer: global super-Gaussian footprint order
 	int* radii,
 	bool debug)
 {
@@ -342,7 +344,9 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		out_feature, // //
-		out_others), debug)
+		out_others,
+		surfel_contrib, // single-layer
+		super_gaussian_order), debug) // single-layer
 
 	return num_rendered;
 }
@@ -383,6 +387,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
+	float super_gaussian_order, // single-layer
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -430,7 +435,8 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dnormal,
 		dL_dopacity,
 		dL_dcolor,
-		dL_dfeature), debug)
+		dL_dfeature,
+		super_gaussian_order), debug) // single-layer
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

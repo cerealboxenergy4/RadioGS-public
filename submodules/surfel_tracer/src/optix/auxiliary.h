@@ -13,6 +13,20 @@
 
 namespace surfel_tracer{
 
+// Super-Gaussian footprint power: alpha = opacity * exp(power(rho, order)).
+// order == 2  -> returns -0.5*rho  (standard 2D Gaussian, exact backward-compatible special case).
+// order  > 2  -> sharper, flatter-topped falloff (the "ironed" footprint).
+__device__ __forceinline__ float super_gaussian_power(float rho, float order) {
+	rho = fmaxf(rho, 0.0f);
+	if (order == 2.0f) return -0.5f * rho;            // exact short-circuit
+	return -0.5f * __powf(rho, 0.5f * order);
+}
+// d(power)/d(rho) factor k such that dG/dp_g = -G * k * p_g  (k == 1 at order 2).
+__device__ __forceinline__ float super_gaussian_grad_k(float rho, float order) {
+	if (order == 2.0f) return 1.0f;
+	return 0.5f * order * __powf(fmaxf(rho, 1e-12f), 0.5f * order - 1.0f);
+}
+
 __device__ const float SH_C0 = 0.28209479177387814f;
 __device__ const float SH_C1 = 0.4886025119029199f;
 __device__ const float SH_C2[] = {

@@ -69,6 +69,10 @@ class Scene:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
+            _init_ply = getattr(args, 'init_ply', '')
+            if _init_ply:
+                from scene.dataset_readers import fetchPly
+                scene_info = scene_info._replace(point_cloud=fetchPly(_init_ply), ply_path=_init_ply)
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
                 dest_file.write(src_file.read())
             json_cams = []

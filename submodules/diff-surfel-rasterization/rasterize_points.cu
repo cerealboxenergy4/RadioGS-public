@@ -37,7 +37,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
 	return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -58,6 +58,7 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
+	const float super_gaussian_order, // single-layer
 	const bool debug)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
@@ -88,7 +89,8 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_contrib = torch::full({2, H, W}, 0.0, int_opts);	// //
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor out_feature = torch::full({S, H, W}, 0.0, float_opts);	// //
-  torch::Tensor out_others = torch::full({3+3+1, H, W}, 0.0, float_opts);
+  torch::Tensor out_others = torch::full({3+3+1+1, H, W}, 0.0, float_opts); // single-layer: +1 for M2_LAYER (N_eff)
+  torch::Tensor surfel_contrib = torch::full({P}, 0.0, float_opts); // single-layer: per-Gaussian max contribution
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
   
@@ -136,10 +138,12 @@ RasterizeGaussiansCUDA(
 		out_color.contiguous().data_ptr<float>(),
 		out_feature.contiguous().data_ptr<float>(),	// //
 		out_others.contiguous().data_ptr<float>(),
+		surfel_contrib.contiguous().data_ptr<float>(), // single-layer
+		super_gaussian_order, // single-layer
 		radii.contiguous().data_ptr<int>(),
 		debug);
   }
-  return std::make_tuple(rendered, out_contrib, out_color, out_feature, out_others, radii, geomBuffer, binningBuffer, imgBuffer);
+  return std::make_tuple(rendered, out_contrib, out_color, out_feature, out_others, surfel_contrib, radii, geomBuffer, binningBuffer, imgBuffer);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -168,7 +172,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
 	const torch::Tensor& out_contrib,
-	const bool debug) 
+	const float super_gaussian_order, // single-layer
+	const bool debug)
 {
 
   CHECK_INPUT(background);
@@ -244,6 +249,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dsh.contiguous().data_ptr<float>(),
 	  dL_dscales.contiguous().data_ptr<float>(),
 	  dL_drotations.contiguous().data_ptr<float>(),
+	  super_gaussian_order, // single-layer
 	  debug);
   }
 

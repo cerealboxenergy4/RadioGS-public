@@ -54,6 +54,8 @@ namespace CudaRasterizer
 			float* out_color,
 			float* out_feature, // //
 			float* out_others,
+			float* surfel_contrib, // single-layer
+			float super_gaussian_order, // single-layer
 			int* radii = nullptr,
 			bool debug = false);
 
@@ -91,6 +93,7 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
+			float super_gaussian_order, // single-layer
 			bool debug);
 	};
 };

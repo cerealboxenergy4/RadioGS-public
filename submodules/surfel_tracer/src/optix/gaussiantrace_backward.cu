@@ -28,6 +28,8 @@ extern "C" __global__ void __raygen__rg() {
 
 	float D = 0.0f, D_final = params.depths[idx.x], grad_depths = params.grad_depths[idx.x];
 	float O = 0.0f, grad_alpha = params.grad_alpha[idx.x];
+	// single-layer: k_eff surrogate second moment (M2 = Sum w_i^2) replay + its upstream gradient
+	float M2 = 0.0f, M2_final = params.alpha_m2[idx.x], grad_alpha_m2 = params.grad_alpha_m2[idx.x];
 
 	float T = 1.0f, t_start = 0.0f, t_curr = 0.0f;
 
@@ -91,7 +93,8 @@ extern "C" __global__ void __raygen__rg() {
 				glm::vec3 pos = ray_o + d * ray_d - mean3D;
 				glm::vec2 p_g = {glm::dot(ru, pos), glm::dot(rv, pos)}; 
 
-				float G = __expf(-0.5f * glm::dot(p_g, p_g));
+				float rho = glm::dot(p_g, p_g);
+				float G = __expf(super_gaussian_power(rho, params.super_gaussian_order));
 				float alpha = min(0.99, o * G);
 				if (alpha<params.alpha_min) continue;
 
@@ -102,7 +105,8 @@ extern "C" __global__ void __raygen__rg() {
 				N += w * n_flip;
 				D += w * d;
 				O += w;
-				
+				M2 += w * w;  // single-layer: replay Sum w_i^2 (includes current hit, as in forward)
+
 				for (int j = 0; j < params.S; ++j){
 					F[j] += w * params.features[gs_idx * S + j];
 				}
@@ -119,8 +123,11 @@ extern "C" __global__ void __raygen__rg() {
 				float dL_dalpha = (
 					glm::dot(grad_color, T * c - (C_final - C)) +
 					glm::dot(grad_normal, T * n_flip - (N_final - N)) +
-					grad_depths * (T * d - (D_final - D)) + 
-					grad_alpha * (1 - O_final)
+					grad_depths * (T * d - (D_final - D)) +
+					grad_alpha * (1 - O_final) +
+					// single-layer: M2 = Sum w_i^2 contribution. dM2/dalpha_j shares the same 1/(1-alpha)
+					// structure as the linear outputs; the per-hit "value" is w_j itself (factor 2).
+					grad_alpha_m2 * 2.0f * (T * w - (M2_final - M2))
 				);
 
 				for (int j = 0; j < S; ++j){
@@ -131,7 +138,9 @@ extern "C" __global__ void __raygen__rg() {
 				computeColorFromSH_backward(params.deg, ray_d, params.shs + gs_idx * params.max_coeffs, dL_dc, dL_dray_d, params.grad_shs + gs_idx * params.max_coeffs);
 				float dL_do = dL_dalpha * G;
 				float dL_dG = dL_dalpha * o;
-				glm::vec2 dL_dpg = -dL_dG * G * p_g;
+				// dG/dp_g = -G * k * p_g, with k = (order/2)*rho^(order/2-1); k==1 at order 2.
+				float k = super_gaussian_grad_k(rho, params.super_gaussian_order);
+				glm::vec2 dL_dpg = -dL_dG * G * k * p_g;
 				glm::vec3 dL_dru = dL_dpg.x * pos;
 				glm::vec3 dL_drv = dL_dpg.y * pos;
 				glm::vec3 dL_dpos = dL_dpg.x * ru + dL_dpg.y * rv;

@@ -98,6 +98,8 @@ if __name__ == '__main__':
         # load gaussians
         # 
         gaussians = RadioGSModel(3)
+        gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
+        gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
         
 
         if args.iteration < 0:

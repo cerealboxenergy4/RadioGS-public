@@ -55,6 +55,7 @@ def render_finetune(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -187,7 +188,7 @@ def render_finetune(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.
     radiosity = torch.abs((diffuse + specular) - nvs_precomp).mean(dim=-1, keepdim=True)
     features = torch.cat([features, radiosity], dim=-1)
 
-    contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,

@@ -18,7 +18,11 @@ extern "C" __global__ void __raygen__rg() {
 
 	glm::vec3 C = glm::vec3(0.0f, 0.0f, 0.0f), N = glm::vec3(0.0f, 0.0f, 0.0f);
 	float D = 0.0f, O = 0.0f, T = 1.0f, t_start = 0.0f, t_curr = 0.0f;
+	float M2 = 0.0f;  // single-layer: Sum_i w_i^2, the per-ray k_eff surrogate denominator
 	float F[MAX_FEATURE_SIZE] = {0.0f};
+
+	// single-layer / first-hit instrumentation: per-ray accepted hits (k_eff) and candidate intersections.
+	unsigned int khit = 0, kcand = 0;
 
 	HitInfo hitArray[MAX_BUFFER_SIZE];
 	unsigned int hitArrayPtr0 = (unsigned int)((uintptr_t)(&hitArray) & 0xFFFFFFFF);
@@ -56,6 +60,7 @@ extern "C" __global__ void __raygen__rg() {
 			}
 			else{
 				t_curr = hitArray[i].t;
+				kcand += 1;  // single-layer: a candidate surfel intersection examined on this ray
 				int gs_idx = params.gs_idxs[primIdx];
 
 				float o = params.opacity[gs_idx];
@@ -83,8 +88,8 @@ extern "C" __global__ void __raygen__rg() {
 				float d_g = glm::dot(n, ray_d);
 				float d = -o_g * d_g / max(1e-6f, d_g * d_g);
 				glm::vec3 pos = ray_o + d * ray_d - mean3D;
-				glm::vec2 p_g = {glm::dot(ru, pos), glm::dot(rv, pos)}; 
-				float alpha = min(0.99, o * __expf(-0.5f * glm::dot(p_g, p_g)));
+				glm::vec2 p_g = {glm::dot(ru, pos), glm::dot(rv, pos)};
+				float alpha = min(0.99, o * __expf(super_gaussian_power(glm::dot(p_g, p_g), params.super_gaussian_order)));
 
 				if (alpha<params.alpha_min) continue;
 
@@ -98,12 +103,21 @@ extern "C" __global__ void __raygen__rg() {
 				N += w * n_flip;
 				D += w * d;
 				O += w;
+				M2 += w * w;  // single-layer: accumulate Sum w_i^2 for the k_eff surrogate
 
 				for (int j = 0; j < params.S; ++j){
 					F[j] += w * params.features[gs_idx * params.S + j];
 				}
 
 				T *= (1 - alpha);
+				khit += 1;  // single-layer: an accepted (contributing) surfel on this ray -> k_eff
+
+				// First-hit north-star: terminate the ray at its first accepted surfel (k_eff := 1).
+				// When the scene is ironed so one near-opaque surfel sits at each intersection, this
+				// loses almost no energy while collapsing the per-ray sort/accumulate cost.
+				if (params.first_hit_only){
+					T = 0.0f;
+				}
 
 				if (T < params.transmittance_min){
 					break;
@@ -119,8 +133,17 @@ extern "C" __global__ void __raygen__rg() {
 	params.normal[idx.x] = N;
 	params.depth[idx.x] = D;
 	params.alpha[idx.x] = O;
+	params.alpha_m2[idx.x] = M2;  // single-layer: k_eff surrogate second moment
 	for (int i = 0; i < params.S; ++i){
 		params.feature[idx.x * params.S + i] = F[i];
+	}
+
+	// single-layer: accumulate global trace-cost counters (candidates, accepted hits = k_eff).
+	// Optional: only when a counter buffer was provided (eval-time measurement, off in training).
+	if (params.counters != nullptr){
+		atomicAdd(params.counters + 0, (unsigned long long)kcand);
+		atomicAdd(params.counters + 1, (unsigned long long)khit);
+		atomicAdd(params.counters + 2, (unsigned long long)1);  // ray count (rays that ran)
 	}
 }
 

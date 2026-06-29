@@ -72,6 +72,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # render = render_radiogs
 
     gaussians = RadioGSModel(dataset.sh_degree)
+    gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
+    gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
     # set_gaussian_para(gaussians, opt)
     
     scene = Scene(dataset, gaussians)

@@ -165,7 +165,8 @@ renderCUDA(
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-    float* __restrict__ dL_dfeature
+    float* __restrict__ dL_dfeature,
+	float super_gaussian_order
 	)
 {
 	// We rasterize again. Compute necessary block info.
@@ -209,6 +210,7 @@ renderCUDA(
 	float accum_rec_f[MAX_FEATURES] = { 0 }; // //
 	float dL_dpixel[C];
 	float dL_dpixel_f[MAX_FEATURES];
+	float accum_alpha_m2_rec = 0; // single-layer: running sum w_i^2 (reverse)
 
 #if RENDER_AXUTILITY
 	float dL_dreg;
@@ -218,15 +220,17 @@ renderCUDA(
 	const int median_contributor = inside ? n_contrib[pix_id + H * W] : 0;
 	float dL_dmedian_depth;
 	float dL_dmax_dweight;
+	float dL_dalpha_m2 = 0; // single-layer: incoming grad on the N_eff (alpha_m2) channel
 
 	if (inside) {
 		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
 		dL_daccum = dL_depths[ALPHA_OFFSET * H * W + pix_id];
 		dL_dreg = dL_depths[DISTORTION_OFFSET * H * W + pix_id];
-		for (int i = 0; i < 3; i++) 
+		for (int i = 0; i < 3; i++)
 			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
 
 		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
+		dL_dalpha_m2 = dL_depths[M2_LAYER_OFFSET * H * W + pix_id]; // single-layer
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
 	}
 
@@ -317,7 +321,7 @@ renderCUDA(
 
 			// accumulations
 
-			float power = -0.5f * rho;
+			float power = super_gaussian_power(rho, super_gaussian_order); // single-layer: super-Gaussian falloff
 			if (power > 0.0f)
 				continue;
 
@@ -400,9 +404,16 @@ renderCUDA(
 				dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
 				atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
 			}
+
+			// single-layer: gradient of N_eff's alpha_m2 = sum w_i^2 (added AFTER dL_dalpha*=T, like color/normal)
+			const float dL_dalpha_from_m2 = dL_dalpha_m2 * (2.0f * w * T - 2.0f * accum_alpha_m2_rec / (1.f - alpha));
+			accum_alpha_m2_rec += w * w;
 #endif
 
 			dL_dalpha *= T;
+#if RENDER_AXUTILITY
+			dL_dalpha += dL_dalpha_from_m2;
+#endif
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
@@ -420,11 +431,13 @@ renderCUDA(
 			dL_dz += alpha * T * dL_ddepth; 
 #endif
 
+			// single-layer: super-Gaussian sharpens the footprint -> scales the spatial gradient (==1 at order 2)
+			const float spatial_grad_scale = super_gaussian_spatial_grad_scale(rho, super_gaussian_order);
 			if (rho3d <= rho2d) {
 				// Update gradients w.r.t. covariance of Gaussian 3x3 (T)
 				const float2 dL_ds = {
-					dL_dG * -G * s.x + dL_dz * Tw.x,
-					dL_dG * -G * s.y + dL_dz * Tw.y
+					dL_dG * -G * spatial_grad_scale * s.x + dL_dz * Tw.x,
+					dL_dG * -G * spatial_grad_scale * s.y + dL_dz * Tw.y
 				};
 				const float3 dz_dTw = {s.x, s.y, 1.0};
 				const float dsx_pz = dL_ds.x / p.z;
@@ -453,8 +466,8 @@ renderCUDA(
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
 			} else {
 				// // Update gradients w.r.t. center of Gaussian 2D mean position
-				const float dG_ddelx = -G * FilterInvSquare * d.x;
-				const float dG_ddely = -G * FilterInvSquare * d.y;
+				const float dG_ddelx = -G * spatial_grad_scale * FilterInvSquare * d.x;
+				const float dG_ddely = -G * spatial_grad_scale * FilterInvSquare * d.y;
 				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
 				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
 				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz); // propagate depth loss
@@ -743,7 +756,8 @@ void BACKWARD::render(
 	float* dL_dnormal3D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dfeature // //
+	float* dL_dfeature, // //
+	float super_gaussian_order
 	)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
@@ -768,6 +782,7 @@ void BACKWARD::render(
 		dL_dnormal3D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_dfeature	// //
+		dL_dfeature,	// //
+		super_gaussian_order
 		);
 }

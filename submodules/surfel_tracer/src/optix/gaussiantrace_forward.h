@@ -22,12 +22,16 @@ struct Gaussiantrace_forward {
 		float* feature;
 		float* depth;
 		float* alpha;
+		float* alpha_m2;                  // single-layer: per-ray second moment Sum_i w_i^2 (k_eff surrogate)
 		float alpha_min;
 		float transmittance_min;
 		int deg;
 		int max_coeffs;
 		int S;
 		bool back_culling;
+		float super_gaussian_order;
+		bool first_hit_only;              // single-layer: terminate each ray at its first accepted surfel
+		unsigned long long* counters;     // single-layer: [candidates, accepted_hits(k_eff), rays] (nullable)
 		OptixTraversableHandle handle;
 	};
 

@@ -277,7 +277,9 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	float* __restrict__ out_feature,
-	float* __restrict__ out_others
+	float* __restrict__ out_others,
+	float* __restrict__ out_contrib,             // single-layer: per-Gaussian max contribution (vis-prune)
+	float super_gaussian_order                   // single-layer: global super-Gaussian footprint order
 )
 {
 	// Identify current tile and associated min/max pixel range.
@@ -320,6 +322,7 @@ renderCUDA(
 	float D = { 0 }, D2 = {0};
 	float M1 = {0};
 	float M2 = {0};
+	float alpha_m2 = {0}; // single-layer: sum of squared compositing weights
 	float distortion = {0};
 	float median_depth = {0};
 	float median_contributor = {-1};
@@ -375,7 +378,7 @@ renderCUDA(
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
 
-			float power = -0.5f * rho;
+			float power = super_gaussian_power(rho, super_gaussian_order); // single-layer: super-Gaussian falloff (order 2 == standard)
 			if (power > 0.0f)
 				continue;
 
@@ -395,6 +398,7 @@ renderCUDA(
 
 			float w = alpha * T;
 #if RENDER_AXUTILITY
+			alpha_m2 += w * w; // single-layer: accumulate sum w_i^2
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
 			float A = 1 - T;
@@ -419,6 +423,7 @@ renderCUDA(
 			for (int ch = 0; ch < S; ch++)
 				F[ch] += features[collected_id[j] * S + ch] * w;
 
+			atomicMaxFloatPositive(&out_contrib[collected_id[j]], w); // single-layer: per-Gaussian max contribution
 
 			T = test_T;
 
@@ -448,6 +453,7 @@ renderCUDA(
 		for (int ch = 0; ch < 3; ch++) out_others[pix_id + (NORMAL_OFFSET + ch) * H * W] = N[ch];
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = D2;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
+		out_others[pix_id + M2_LAYER_OFFSET * H * W] = alpha_m2; // single-layer: sum w_i^2 -> N_eff
 #endif
 	}
 }
@@ -470,7 +476,9 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* out_feature,
-	float* out_others)
+	float* out_others,
+	float* out_contrib,
+	float super_gaussian_order)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -488,7 +496,9 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		out_feature,
-		out_others);
+		out_others,
+		out_contrib,
+		super_gaussian_order);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

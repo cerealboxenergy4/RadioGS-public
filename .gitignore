@@ -1,0 +1,31 @@
+# Heavy / generated
+outputs/
+output/
+data/
+eval/
+experiments/
+diagnostics/
+*.pth
+*.ply
+*.npz
+*.npy
+*.exr
+*.hdr
+*.log
+*.out
+*.pdf
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Build artifacts
+build/
+**/build/
+*.so
+*.o
+*.obj
+*.ptx

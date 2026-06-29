@@ -22,6 +22,7 @@ struct Gaussiantrace_backward {
 		const float* feature;
 		const float* depths;
 		const float* alpha;
+		const float* alpha_m2;            // single-layer: forward Sum_i w_i^2 (k_eff surrogate)
 		glm::vec3* grad_rays_o;
 		glm::vec3* grad_rays_d;
 		glm::vec3* grad_means3D;
@@ -36,12 +37,14 @@ struct Gaussiantrace_backward {
 		const float* grad_feature;
 		const float* grad_depths;
 		const float* grad_alpha;
+		const float* grad_alpha_m2;       // single-layer: upstream dL/d(Sum w_i^2) for the k_eff loss
 		float alpha_min;
 		float transmittance_min;
 		int deg;
 		int max_coeffs;
 		int S;
 		bool back_culling;
+		float super_gaussian_order;
 		OptixTraversableHandle handle;
 	};
 

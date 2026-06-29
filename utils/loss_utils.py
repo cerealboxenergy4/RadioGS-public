@@ -18,6 +18,48 @@ from .image_utils import psnr
 import numpy as np
 import trimesh
 import math
+
+
+# ---- single-layer ironing (ported from single-layer-surfel Part 1) ----
+def scheduled_weight(target_weight, iteration, warmup_iters=0, ramp_iters=0, until_iters=0, decay_iters=0):
+    if target_weight <= 0.0:
+        return 0.0
+    if iteration <= warmup_iters:
+        return 0.0
+    weight = float(target_weight)
+    ramp = 1.0 if ramp_iters <= 0 else min(max((iteration - warmup_iters) / float(ramp_iters), 0.0), 1.0)
+    if until_iters is not None and until_iters > 0 and iteration > until_iters:
+        if decay_iters <= 0:
+            return 0.0
+        decay = 1.0 - min(max((iteration - until_iters) / float(decay_iters), 0.0), 1.0)
+        weight *= decay
+    return weight * ramp
+
+
+def single_layer_loss(rend_alpha, rend_alpha_m2, alpha_threshold=0.5, eps=1e-8):
+    """Transmittance-weighted effective layer count N_eff = alpha^2 / sum(w_i^2); penalize (N_eff - 1)
+    on foreground pixels. Drives the surfel shell toward a single layer per camera ray."""
+    neff = rend_alpha.square() / rend_alpha_m2.clamp_min(eps)
+    foreground = rend_alpha > alpha_threshold
+    if foreground.any():
+        values = neff[foreground]
+        return (values - 1.0).clamp_min(0.0).mean(), values.detach().mean(), foreground.float().mean()
+    zero = rend_alpha.sum() * 0.0
+    return zero, zero.detach(), zero.detach()
+
+
+def keff_loss(trace_alpha, trace_alpha_m2, alpha_threshold=0.5, eps=1e-8):
+    """Trace-ray analog of single_layer_loss: per-ray effective layer count along a *traced* ray,
+    k_eff = (Sum w_i)^2 / Sum w_i^2 = trace_alpha^2 / trace_alpha_m2; penalize (k_eff - 1) on rays
+    that actually hit geometry (trace_alpha > threshold). Drives secondary/GI rays toward a single
+    opaque layer per intersection (the part the stage-1 camera-ray N_eff loss can't reach)."""
+    keff = trace_alpha.square() / trace_alpha_m2.clamp_min(eps)
+    foreground = trace_alpha > alpha_threshold
+    if foreground.any():
+        values = keff[foreground]
+        return (values - 1.0).clamp_min(0.0).mean(), values.detach().mean(), foreground.float().mean()
+    zero = trace_alpha.sum() * 0.0
+    return zero, zero.detach(), zero.detach()
 from utils.graphics_utils import rgb_to_srgb, srgb_to_rgb
 
 def cos_loss(output, gt, thrsh=0, weight=1):

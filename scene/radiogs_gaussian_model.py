@@ -797,8 +797,10 @@ class GaussianModel:
         normals_raw = splat2world[: ,2, :3] 
         normals = safe_normalize(normals_raw)
         
-        if not detach_orientation: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling)
-        else: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling)
+        sgo = getattr(self, "super_gaussian_order", 2.0)  # single-layer: ironed footprint order for the tracer
+        fho = getattr(self, "first_hit_only", False)      # single-layer: first-hit trace mode (k_eff := 1)
+        if not detach_orientation: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
+        else: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
         
         alpha_ = alpha[..., None]
         color = torch.where(alpha_ < 1 - self.gaussian_tracer.transmittance_min, color, color / alpha_)
@@ -815,6 +817,29 @@ class GaussianModel:
             "alpha" : alpha,
             "normals": normals,
         }
+
+    def trace_keff(self, rays_o, rays_d, back_culling=False):
+        """Differentiable trace returning only (trace_alpha=Sum w, trace_alpha_m2=Sum w^2) per ray,
+        for the stage-2 k_eff loss. Geometry tensors are built exactly as in trace()."""
+        means3D = self.get_xyz
+        shs = self.get_features
+        opacity = self.get_opacity
+
+        s = 1 / self.get_scaling
+        R = build_rotation(self._rotation)
+        ru = R[:, :, 0] * s[:, 0:1]
+        rv = R[:, :, 1] * s[:, 1:2]
+
+        splat2world = self.get_covariance()
+        normals = safe_normalize(splat2world[:, 2, :3])
+
+        sgo = getattr(self, "super_gaussian_order", 2.0)
+        # full trace (first_hit_only would trivially force k_eff=1 and carry no gradient signal)
+        _, _, _, _, alpha, alpha_m2 = self.gaussian_tracer.trace(
+            rays_o, rays_d, means3D, opacity, ru, rv, normals, None, shs,
+            alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling,
+            super_gaussian_order=sgo, first_hit_only=False, return_alpha_m2=True)
+        return alpha, alpha_m2
 
     def update_incidents_directions(self, incident_directions, incident_areas, mask=None):
         if mask is not None:

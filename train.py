@@ -12,11 +12,11 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import calculate_loss2, calculate_loss3
+from utils.loss_utils import calculate_loss2, calculate_loss3, keff_loss, scheduled_weight
 from gaussian_renderer import render_radiogs
 import sys
 from scene import Scene, RadioGSModel
-from utils.general_utils import safe_state
+from utils.general_utils import safe_state, safe_normalize
 import numpy as np
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -32,6 +32,22 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+
+def sample_keff_rays(gaussians, n_surfels, n_dirs, offset_scale):
+    """Sample secondary/GI-style rays for the k_eff loss: origins at a random subset of surfels
+    (offset along the normal to avoid self-hit), directions over the hemisphere about each normal.
+    Rays are detached; gradients flow only through the traced surfels inside trace_keff()."""
+    xyz = gaussians.get_xyz
+    N = xyz.shape[0]
+    n_surfels = min(n_surfels, N)
+    idx = torch.randint(0, N, (n_surfels,), device=xyz.device)
+    sel_xyz = xyz[idx].detach()
+    normals = safe_normalize(gaussians.get_covariance()[idx, 2, :3]).detach()
+    dirs, _ = sample_incident_rays(normals, is_training=True, sample_num=n_dirs)  # [k, n_dirs, 3]
+    offset = offset_scale * gaussians.get_scaling.mean().detach()
+    origins = (sel_xyz[:, None, :] + offset * normals[:, None, :]).expand(-1, n_dirs, -1)
+    return origins.reshape(-1, 3).contiguous(), dirs.reshape(-1, 3).contiguous()
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, checkpoint_refgs, model_path, debug_from=None):
@@ -53,6 +69,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     render = render_radiogs
 
     gaussians = RadioGSModel(dataset.sh_degree)
+    gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
+    gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
     set_gaussian_para(gaussians, opt)
     
     scene = Scene(dataset, gaussians)
@@ -121,6 +139,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         
         total_loss, tb_dict = calculate_loss3(viewpoint_cam, gaussians, render_pkg, opt, iteration)
         dist_loss, normal_loss, loss = tb_dict["loss_dist"], tb_dict["loss_normal_render_depth"], tb_dict["loss"]
+
+        # ---- single-layer trace-ray k_eff loss (stage-2 analog of stage-1 N_eff single_layer_loss) ----
+        keff_w = scheduled_weight(opt.lambda_keff, iteration, opt.keff_warmup_iters,
+                                  opt.keff_ramp_iters, opt.keff_until_iter, opt.keff_decay_iters)
+        if keff_w > 0.0 and (iteration % max(1, opt.keff_interval) == 0):
+            rays_o_k, rays_d_k = sample_keff_rays(gaussians, opt.keff_n_surfels, opt.keff_n_dirs, opt.keff_offset_scale)
+            trace_alpha, trace_alpha_m2 = gaussians.trace_keff(rays_o_k, rays_d_k, back_culling=pipe.back_culling)
+            keff_raw, keff_mean, keff_hit = keff_loss(trace_alpha, trace_alpha_m2, opt.keff_alpha_thresh)
+            total_loss = total_loss + keff_w * keff_raw
+            tb_dict["loss_keff"] = float(keff_raw.detach())
+            tb_dict["keff_mean"] = float(keff_mean)
+            tb_dict["keff_hit_frac"] = float(keff_hit)
+
         total_loss.backward()
             
         iter_end.record()
@@ -162,6 +193,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "Normal": f"{ema_normal_for_log:.{5}f}",
                     "Points": f"{gaussians.get_xyz.shape[0]}",
+                    "Keff": f"{tb_dict.get('keff_mean', 0.0):.3f}",
                     "PSNR-train": f"{ema_psnr_for_log:.{4}f}",
                     "PSNR-test": f"{psnr_test:.{4}f}"
                 }

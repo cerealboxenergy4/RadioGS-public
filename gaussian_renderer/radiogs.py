@@ -102,6 +102,7 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -146,7 +147,7 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
             colors_precomp = colors_precomp * mask
         shs = None
 
-    contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -391,7 +392,7 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
             colors_precomp = colors_precomp * mask + torch.rand_like(colors_precomp) * (1-mask) * mask2
 
     # rasterize second features
-    contrib, pbr_rendered_image, pbr_rendered_features, radii, allmap = rasterizer(
+    contrib, pbr_rendered_image, pbr_rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = None,

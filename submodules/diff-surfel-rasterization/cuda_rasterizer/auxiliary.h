@@ -26,7 +26,44 @@
 #define NORMAL_OFFSET 2 
 #define MIDDEPTH_OFFSET 5
 #define DISTORTION_OFFSET 6
-// #define MEDIAN_WEIGHT_OFFSET 7
+#define M2_LAYER_OFFSET 7          // single-layer: second moment of compositing weights (sum w_i^2) -> N_eff
+// #define MEDIAN_WEIGHT_OFFSET 8
+
+// ---- Single-layer / super-Gaussian footprint helpers (ported from single-layer-surfel 2DGS) ----
+// Per-Gaussian max contribution accumulation (for visibility pruning).
+__forceinline__ __device__ void atomicMaxFloatPositive(float* address, float val)
+{
+	int* address_as_i = reinterpret_cast<int*>(address);
+	int old = *address_as_i;
+	int assumed;
+	while (__int_as_float(old) < val)
+	{
+		assumed = old;
+		old = atomicCAS(address_as_i, assumed, __float_as_int(val));
+		if (assumed == old)
+			break;
+	}
+}
+// Super-Gaussian footprint power: alpha = opacity * exp(power). order==2 -> standard Gaussian (-0.5*rho).
+__device__ __forceinline__ float super_gaussian_power(float rho, float super_gaussian_order)
+{
+	super_gaussian_order = fmaxf(super_gaussian_order, 2.0f);
+	if (fabsf(super_gaussian_order - 2.0f) < 1e-6f)
+		return -0.5f * rho;
+	const float beta = 0.5f * super_gaussian_order;
+	return -0.5f * powf(fmaxf(rho, 0.0f), beta);
+}
+// d(power)/d(rho) factor relative to standard Gaussian (==1 at order 2); scales the spatial gradient.
+__device__ __forceinline__ float super_gaussian_spatial_grad_scale(float rho, float super_gaussian_order)
+{
+	super_gaussian_order = fmaxf(super_gaussian_order, 2.0f);
+	if (fabsf(super_gaussian_order - 2.0f) < 1e-6f)
+		return 1.0f;
+	const float beta = 0.5f * super_gaussian_order;
+	if (rho <= 0.0f)
+		return beta > 1.0f ? 0.0f : 1.0f;
+	return beta * powf(rho, beta - 1.0f);
+}
 
 // distortion helper macros
 #define BACKFACE_CULL 1

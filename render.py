@@ -260,6 +260,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, extra: str, only_dist: bool = False, bg_color: float  = -1.0, start=0):
     with torch.no_grad():
         gaussians = RadioGSModel(dataset.sh_degree)
+        gaussians.super_gaussian_order = getattr(pipeline, "super_gaussian_order", 2.0)  # single-layer ironing
+        gaussians.first_hit_only = getattr(pipeline, "first_hit_only", False)  # single-layer: first-hit trace mode
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.build_bvh()      
         gaussians.env_map.update_pdf()

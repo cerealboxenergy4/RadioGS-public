@@ -47,6 +47,7 @@ def load_rasterizer(pipe,
         sh_degree=sh_degree,
         campos=campos,
         prefiltered=prefiltered,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -127,6 +128,7 @@ def render_initial(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
 
@@ -188,7 +190,7 @@ def render_initial(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
     else:
         colors_precomp = override_color
         
-    contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -217,6 +219,8 @@ def render_initial(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
         "visibility_filter" : radii > 0,
         "radii": radii,
         'rend_alpha': render_alpha,
+        'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+        'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
         'rend_normal': render_normal,
         'rend_dist': render_dist,
         'surf_depth': surf_depth,
@@ -258,6 +262,7 @@ def render_surfel(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
 
@@ -322,7 +327,7 @@ def render_surfel(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
     sh2indirect = eval_sh(3, shs_indirect, reflection)
     indirect = torch.clamp_min(sh2indirect, 0.0)
 
-    contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -381,7 +386,7 @@ def render_surfel(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
     # render with sh 
     shs = pc.get_features
     colors_precomp = None
-    contrib, rendered_image_sh, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image_sh, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -410,6 +415,8 @@ def render_surfel(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
             "visibility_filter" : radii > 0,
             "radii": radii,
             'rend_alpha': render_alpha,
+            'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+            'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
             'rend_normal': render_normal,
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
@@ -457,6 +464,7 @@ def render_surfel2(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
 
@@ -515,7 +523,7 @@ def render_surfel2(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
     
     normals = pc.get_normal(scaling_modifier, dir_pp_normalized)
     
-    contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -567,6 +575,8 @@ def render_surfel2(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
         "visibility_filter" : radii > 0,
         "radii": radii,
         'rend_alpha': render_alpha,
+        'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+        'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
         'rend_normal': render_normal,
         'rend_dist': render_dist,
         'surf_depth': surf_depth,
@@ -618,6 +628,7 @@ def render_volume(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
 
@@ -696,7 +707,7 @@ def render_volume(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
     else:
         features = torch.cat((roughness, metallic, diffuse, specular, base_color, light), dim=-1)
 
-    contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -767,7 +778,7 @@ def render_volume(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
     rad = torch.abs(colors_sh - colors_pbr).mean(-1, keepdim=True)
     
     rad_accum = pc.get_radiosity_accum
-    contrib, rendered_image_sh, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image_sh, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = None,
@@ -793,6 +804,8 @@ def render_volume(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
             "visibility_filter" : radii > 0,
             "radii": radii,
             'rend_alpha': render_alpha,
+            'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+            'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
             'rend_normal': render_normal,
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
@@ -861,6 +874,7 @@ def render_volume_test(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color :
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        super_gaussian_order=getattr(pipe, 'super_gaussian_order', 2.0),  # single-layer ironing
         debug=pipe.debug
     )
 
@@ -944,7 +958,7 @@ def render_volume_test(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color :
 
     features = torch.cat((roughness, metallic, diffuse, specular, base_color, light, visibility, indirect, direct_light,), dim=-1)
 
-    contrib, rendered_image, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -1011,7 +1025,7 @@ def render_volume_test(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color :
     # render radiosity
     rad = torch.abs(colors_sh - colors_pbr).mean(-1, keepdim=True)
     
-    contrib, rendered_image_sh, rendered_features, radii, allmap = rasterizer(
+    contrib, rendered_image_sh, rendered_features, radii, allmap, surfel_contrib = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = None,
@@ -1039,6 +1053,8 @@ def render_volume_test(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color :
             "radii": radii,
             ## normal, accum alpha, dist, depth map
             'rend_alpha': render_alpha,
+            'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+            'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
             'rend_normal': render_normal,
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
