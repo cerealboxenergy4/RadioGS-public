@@ -29,3 +29,4 @@ build/
 *.o
 *.obj
 *.ptx
+nvdiffrast/
