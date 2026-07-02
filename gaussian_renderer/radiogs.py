@@ -513,8 +513,8 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
         incident_areas = incident_areas[chunk_idx:chunk_idx+CHUNK_SIZE]
         incident_visibility = incident_visibility[chunk_idx:chunk_idx+CHUNK_SIZE]
         local_incident_lights = local_incident_lights[chunk_idx:chunk_idx+CHUNK_SIZE]
-    global_incident_lights = envmap(incident_dirs, mode='pure_env')    
-    
+    global_incident_lights = envmap(incident_dirs, mode='pure_env')
+
     if relight:
         features = torch.cat([pc.get_base_color, pc.get_rough], dim=1)
         trace_outputs = pc.trace(position.unsqueeze(1)+incident_dirs*pipe.light_t_min, incident_dirs, features=features, camera_center=camera_center, back_culling=pipe.back_culling)
@@ -553,6 +553,15 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
     direct_specular = ((f_s) * direct_transport).mean(dim=-2)
     indirect_diffuse = ((f_d) * indirect_transport).mean(dim=-2)
     indirect_specular = ((f_s) * indirect_transport).mean(dim=-2)
+
+    # radiosity: replace the one-bounce diffuse INDIRECT with the multi-bounce solved indirect.
+    # Direct diffuse and the entire specular path (incl. one-bounce specular indirect) are kept.
+    if getattr(pipe, 'use_radiosity_solve', False) and getattr(pc, '_radiosity_indirect', None) is not None:
+        rad_ind = pc._radiosity_indirect
+        if chunk_idx is not None:
+            rad_ind = rad_ind[chunk_idx:chunk_idx + CHUNK_SIZE]
+        indirect_diffuse = rad_ind
+        diffuse = direct_diffuse + rad_ind
 
     if training:
         results = {

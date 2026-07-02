@@ -11,12 +11,14 @@ class _GaussianTrace(torch.autograd.Function):
         depth = torch.zeros_like(rays_o[:, 0])
         alpha = torch.zeros_like(rays_o[:, 0])
         alpha_m2 = torch.zeros_like(rays_o[:, 0])  # single-layer: per-ray Sum w_i^2 (k_eff surrogate)
+        # radiosity: per-ray first-accepted surfel gs_idx (-1 if the ray hits nothing)
+        hit_idx = torch.full((rays_o.shape[0],), -1, dtype=torch.int32, device=rays_o.device)
         # single-layer: counters is a 3-long int64 tensor [candidates, accepted_hits, rays] or empty (off)
         if counters is None:
             counters = torch.empty(0, dtype=torch.int64, device=rays_o.device)
         bvh.trace_forward(
             rays_o, rays_d, gs_idxs, means3D, opacity, ru, rv, normals, features, shs,
-            color, normal, feature, depth, alpha, alpha_m2,
+            color, normal, feature, depth, alpha, alpha_m2, hit_idx,
             alpha_min, transmittance_min, deg, back_culling, super_gaussian_order,
             first_hit_only, counters
         )
@@ -28,10 +30,10 @@ class _GaussianTrace(torch.autograd.Function):
         ctx.back_culling = back_culling
         ctx.super_gaussian_order = super_gaussian_order
         ctx.save_for_backward(rays_o, rays_d, gs_idxs, means3D, opacity, ru, rv, normals, features, shs, color, normal, feature, depth, alpha, alpha_m2)
-        return color, normal, feature, depth, alpha, alpha_m2
+        return color, normal, feature, depth, alpha, alpha_m2, hit_idx
 
     @staticmethod
-    def backward(ctx, grad_out_color, grad_out_normal, grad_out_feature, grad_out_depth, grad_out_alpha, grad_out_alpha_m2):
+    def backward(ctx, grad_out_color, grad_out_normal, grad_out_feature, grad_out_depth, grad_out_alpha, grad_out_alpha_m2, grad_out_hit_idx):
         rays_o, rays_d, gs_idxs, means3D, opacity, ru, rv, normals, features, shs, color, normal, feature, depth, alpha, alpha_m2 = ctx.saved_tensors
         grad_rays_o = torch.zeros_like(rays_o)
         grad_rays_d = torch.zeros_like(rays_d)
@@ -106,7 +108,7 @@ class GaussianTracer():
         self.gs_idxs = gs_idxs.int()
         self.impl.update_bvh(vertices_b[faces_b])
 
-    def trace(self, rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min, deg=3, back_culling=False, super_gaussian_order=2.0, first_hit_only=False, return_alpha_m2=False):
+    def trace(self, rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min, deg=3, back_culling=False, super_gaussian_order=2.0, first_hit_only=False, return_alpha_m2=False, return_hit_idx=False):
         rays_o = rays_o.contiguous()
         rays_d = rays_d.contiguous()
         means3D = means3D.contiguous()
@@ -133,6 +135,7 @@ class GaussianTracer():
         depth = torch.zeros(B, dtype=torch.float32, device='cuda')
         alpha = torch.zeros(B, dtype=torch.float32, device='cuda')
         alpha_m2 = torch.zeros(B, dtype=torch.float32, device='cuda')  # single-layer: Sum w_i^2
+        hit_idx = torch.full((B,), -1, dtype=torch.int32, device='cuda')  # radiosity: first-hit gs_idx (-1 = miss)
 
         rays_o_ = rays_o[mask]
         rays_d_ = rays_d[mask]
@@ -143,7 +146,7 @@ class GaussianTracer():
                 self.reset_counters()
             counters = self.counter_accum
         if not rays_o_.shape[0] == 0:
-            color[mask], normal[mask], feature[mask], depth[mask], alpha[mask], alpha_m2[mask] = _GaussianTrace.apply(self.impl, rays_o_, rays_d_, self.gs_idxs, means3D, opacity, ru, rv, normals, features, shs, alpha_min, self.transmittance_min, deg, back_culling, super_gaussian_order, first_hit_only, counters)
+            color[mask], normal[mask], feature[mask], depth[mask], alpha[mask], alpha_m2[mask], hit_idx[mask] = _GaussianTrace.apply(self.impl, rays_o_, rays_d_, self.gs_idxs, means3D, opacity, ru, rv, normals, features, shs, alpha_min, self.transmittance_min, deg, back_culling, super_gaussian_order, first_hit_only, counters)
 
         color = color.view(*prefix, 3)
         normal = normal.view(*prefix, 3)
@@ -151,7 +154,10 @@ class GaussianTracer():
         depth = depth.view(*prefix)
         alpha = alpha.view(*prefix)
         alpha_m2 = alpha_m2.view(*prefix)
+        hit_idx = hit_idx.view(*prefix)
 
+        if return_hit_idx:
+            return color, normal, feature, depth, alpha, hit_idx
         if return_alpha_m2:
             return color, normal, feature, depth, alpha, alpha_m2
         return color, normal, feature, depth, alpha

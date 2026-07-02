@@ -12,6 +12,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud, rgb_to_srgb
 from utils.general_utils import strip_symmetric, build_scaling_rotation, safe_normalize, flip_align_view, rotation_to_quaternion, quaternion_multiply
 from surfel_tracer import GaussianTracer
+from utils.radiosity import RadiosityModule
 import trimesh
 from utils.system_utils import Timing
 import nvdiffrast.torch as dr
@@ -124,6 +125,13 @@ class GaussianModel:
         self.incident_visibility = torch.empty(0)
         self.incident_radiance = torch.empty(0)
         self.incident_areas = torch.empty(0)
+
+        # radiosity: static sparse transport matrix T (and its transpose) built once under
+        # frozen geometry, plus the most recent per-surfel diffuse indirect solution.
+        self.radiosity_T = None
+        self.radiosity_Tt = None
+        self._radiosity_L = None            # per-surfel total diffuse radiance (warm start / viz)
+        self._radiosity_indirect = None     # per-surfel diffuse INDIRECT injected into the render [N,3]
         
     @torch.no_grad()
     def set_transform(self, rotation=None, center=None, scale=None, offset=None, transform=None):
@@ -840,6 +848,134 @@ class GaussianModel:
             alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling,
             super_gaussian_order=sgo, first_hit_only=False, return_alpha_m2=True)
         return alpha, alpha_m2
+
+    @torch.no_grad()
+    def trace_hit_idx(self, rays_o, rays_d, back_culling=False):
+        """Radiosity: return per-ray (hit_idx, alpha) where hit_idx is the gs_idx of the first
+        accepted surfel along each ray (-1 if the ray hits nothing). Geometry-only; runs under
+        no_grad and is used once to assemble the static transport matrix T."""
+        means3D = self.get_xyz
+        shs = self.get_features
+        opacity = self.get_opacity
+
+        s = 1 / self.get_scaling
+        R = build_rotation(self._rotation)
+        ru = R[:, :, 0] * s[:, 0:1]
+        rv = R[:, :, 1] * s[:, 1:2]
+
+        splat2world = self.get_covariance()
+        normals = safe_normalize(splat2world[:, 2, :3])
+
+        sgo = getattr(self, "super_gaussian_order", 2.0)
+        fho = getattr(self, "first_hit_only", False)
+        _, _, _, _, alpha, hit_idx = self.gaussian_tracer.trace(
+            rays_o, rays_d, means3D, opacity, ru, rv, normals, None, shs,
+            alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling,
+            super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=True)
+        return hit_idx, alpha
+
+    @torch.no_grad()
+    def build_radiosity_transport(self, light_t_min=0.05, back_culling=False, chunk=100000, drop_self=True):
+        """Radiosity: assemble the STATIC sparse transport matrix T [N,N] from the cached
+        incident rays and their first-hit surfel indices. Geometry-only / light-independent,
+        so it is built once under frozen geometry (rebuilt only if directions/geometry change).
+
+            T_ij = (1/S) * sum_{s : firsthit(i,s)=j} incident_areas[i,s] * clamp(<n_i, dir_{i,s}>, 0)
+
+        Visibility is automatic under first-hit tracing (the first accepted surfel IS the
+        visible one; rays that escape to the env contribute no entry). Self-hits are dropped.
+        Requires update_incidents_directions / precompute_incidents(only_vis) to have run.
+        """
+        assert self.incident_directions.numel() > 0, \
+            "incident rays must be sampled first (update_incidents_directions / precompute_incidents)"
+        N = self.get_xyz.shape[0]
+        S = self.incident_directions.shape[1]
+        xyz = self.get_xyz
+        splat2world = self.get_covariance()
+        normals = safe_normalize(splat2world[:, 2, :3])  # [N,3]
+
+        rows_all, cols_all, vals_all = [], [], []
+        for lo in range(0, N, chunk):
+            hi = min(lo + chunk, N)
+            n = hi - lo
+            dirs = self.incident_directions[lo:hi]            # [n,S,3]
+            areas = self.incident_areas[lo:hi, ..., 0]        # [n,S]
+            rays_o = xyz[lo:hi].unsqueeze(1) + dirs * light_t_min
+            hit, _ = self.trace_hit_idx(rays_o.reshape(-1, 3), dirs.reshape(-1, 3))
+            hit = hit.view(n, S).long()                       # [n,S]
+            cos = (normals[lo:hi].unsqueeze(1) * dirs).sum(-1).clamp(min=0)  # [n,S]
+            vals = (areas * cos) / float(S)                   # [n,S]
+            rows = torch.arange(lo, hi, device=xyz.device).unsqueeze(1).expand(n, S)
+            valid = (hit >= 0) & (vals > 0)
+            if drop_self:
+                valid = valid & (hit != rows)
+            rows_all.append(rows[valid])
+            cols_all.append(hit[valid])
+            vals_all.append(vals[valid])
+
+        rows = torch.cat(rows_all)
+        cols = torch.cat(cols_all)
+        vals = torch.cat(vals_all).to(torch.float32)
+        indices = torch.stack([rows, cols], dim=0)
+        T = torch.sparse_coo_tensor(indices, vals, (N, N)).coalesce()
+        self.radiosity_T = T
+        self.radiosity_Tt = T.t().coalesce()
+        self._radiosity_L = None  # invalidate warm start
+        return T
+
+    def solve_diffuse_radiosity(self, iters=16, base_color_scale=1.0, differentiable=False, warm_start=True,
+                                add_specular=True, f0=0.04):
+        """Radiosity: solve the multi-bounce diffuse radiosity over the static T and cache the
+        per-surfel diffuse INDIRECT outgoing radiance into self._radiosity_indirect [N,3], which
+        rendering_equation injects in place of the one-bounce indirect_diffuse.
+
+            H_i = (albedo_i/pi) * mean_s( vis * L_env(dir) * area * cos )   # shadowed direct diffuse
+            L   = H + (albedo/pi) * (T @ L)                                 # multi-bounce solve
+            indirect = (albedo/pi) * (T @ L)                                # injected (direct kept separate)
+        """
+        assert self.radiosity_T is not None, "call build_radiosity_transport() first"
+        dirs = self.incident_directions                       # [N,S,3]
+        areas = self.incident_areas                           # [N,S,1]
+        vis = self.incident_visibility                        # [N,S,1]
+        ctx = torch.enable_grad() if differentiable else torch.no_grad()
+        with ctx:
+            splat2world = self.get_covariance()
+            normals = safe_normalize(splat2world[:, 2, :3])   # [N,3]
+            n_d_i = (normals.unsqueeze(1) * dirs).sum(-1, keepdim=True).clamp(min=0)  # [N,S,1]
+            Lenv = self.get_envmap(dirs, mode='pure_env')     # [N,S,3]
+            direct_irr = (vis * Lenv * areas * n_d_i).mean(dim=-2)   # [N,3] = mean_s(vis*Lenv*area*cos)
+            albedo = self.get_base_color
+            if not isinstance(base_color_scale, float):
+                albedo = albedo * base_color_scale[None, :]
+            coef = albedo / np.pi                             # [N,3]
+            H = coef * direct_irr                             # [N,3] shadowed direct diffuse outgoing
+            if not differentiable:
+                coef = coef.detach(); H = H.detach()
+            L_init = self._radiosity_L if (warm_start and self._radiosity_L is not None
+                                           and self._radiosity_L.shape == H.shape) else None
+            L = RadiosityModule.apply(self.radiosity_T, self.radiosity_Tt, coef, H, iters, L_init)
+            # Gather source = diffuse multi-bounce radiance L (+ each surfel's one-bounce SPECULAR
+            # outgoing radiance, so the receiver's diffuse reflection sees the same incident energy the
+            # baseline bounce does — its source is trace_diffuse+trace_specular). Specular is view-
+            # dependent; we use a head-on (N·V=1) split-sum proxy, consistent with RadioGS's specular.
+            source = L
+            if add_specular:
+                # The roughness-prefiltered 'specular' mips are not maintained during stage-2 training
+                # (the main render only queries 'pure_env'); build them here from the current env so the
+                # specular proxy works in both train and eval. Detached (env grad flows via H/pure_env).
+                with torch.no_grad():
+                    self.get_envmap.build_mips()
+                rough = self.get_rough                                  # [N,1]
+                fg_uv = torch.cat([torch.ones_like(rough), rough], dim=-1).clamp(0, 1)
+                fg = dr.texture(self.FG_LUT, fg_uv.reshape(1, -1, 1, 2).contiguous(),
+                                filter_mode="linear", boundary_mode="clamp").reshape(-1, 2)  # [N,2]
+                spec_env = self.get_envmap(normals, roughness=rough, mode='specular')         # [N,3]
+                spec = spec_env * (f0 * fg[:, 0:1] + fg[:, 1:2])        # [N,3] one-bounce specular outgoing
+                source = L + spec
+            indirect = coef * torch.sparse.mm(self.radiosity_T, source)   # [N,3] diffuse INDIRECT
+        self._radiosity_indirect = indirect if differentiable else indirect.detach()
+        self._radiosity_L = L.detach()
+        return self._radiosity_indirect
 
     def update_incidents_directions(self, incident_directions, incident_areas, mask=None):
         if mask is not None:

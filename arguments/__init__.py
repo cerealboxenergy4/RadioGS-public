@@ -137,6 +137,17 @@ class PipelineParams(ParamGroup):
         self.bf_random = False
         self.radiosity_random_sample = 1
 
+        # ---- differentiable diffuse radiosity solver (single-layer surfel project) ----
+        # Replace the one-bounce diffuse INDIRECT with a multi-bounce radiosity solve over a
+        # static sparse transport matrix T (built once under frozen geometry from surfel ray
+        # hits). Specular and direct stay unchanged. See utils/radiosity.py.
+        self.use_radiosity_solve = False
+        self.radiosity_solver_iters = 16     # Neumann/Jacobi iterations for the (I-A)L=H solve
+        self.radiosity_rebuild_interval = 0  # 0 == build T once; >0 == rebuild every N iters (geometry drift)
+        self.radiosity_diff = False          # differentiate the solve (grad to albedo/envmap); off for first run
+        self.radiosity_spec_indirect = True  # add each hit's one-bounce specular to the gathered indirect
+                                             # source (matches the baseline bounce energy; diffuse-only T)
+
         # ablation on view
         self.view_ratio = 1.0
 

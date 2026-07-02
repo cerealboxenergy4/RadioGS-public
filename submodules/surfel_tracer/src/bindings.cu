@@ -42,7 +42,7 @@ public:
     void trace_forward(
         const torch::Tensor rays_o, const torch::Tensor rays_d, const torch::Tensor gs_idxs, 
         const torch::Tensor means3D, const torch::Tensor opacity, const torch::Tensor ru, const torch::Tensor rv, const torch::Tensor normals, const torch::Tensor features, const torch::Tensor shs, 
-        torch::Tensor color, torch::Tensor normal, torch::Tensor feature, torch::Tensor depth, torch::Tensor alpha, torch::Tensor alpha_m2,
+        torch::Tensor color, torch::Tensor normal, torch::Tensor feature, torch::Tensor depth, torch::Tensor alpha, torch::Tensor alpha_m2, torch::Tensor hit_idx,
         const float alpha_min, const float transmittance_min, const int deg, const bool back_culling, const float super_gaussian_order,
         const bool first_hit_only, torch::Tensor counters
         ){
@@ -54,11 +54,13 @@ public:
 
         // single-layer: pass the counter buffer only when one was provided (numel>0), else nullptr.
         unsigned long long* counters_ptr = (counters.numel() > 0) ? (unsigned long long*)counters.data_ptr<int64_t>() : nullptr;
+        // radiosity: pass the first-hit index buffer only when requested (numel>0), else nullptr.
+        int* hit_idx_ptr = (hit_idx.numel() > 0) ? hit_idx.data_ptr<int>() : nullptr;
 
         triangle_bvh->gaussian_trace_forward(
             n_elements, S, (const glm::vec3*)rays_o.data_ptr<float>(), (const glm::vec3*)rays_d.data_ptr<float>(), gs_idxs.data_ptr<int>(),
             (const glm::vec3*)means3D.data_ptr<float>(), opacity.data_ptr<float>(), (const glm::vec3*)ru.data_ptr<float>(), (const glm::vec3*)rv.data_ptr<float>(), (const glm::vec3*)normals.data_ptr<float>(), features.data_ptr<float>(), (const glm::vec3*)shs.data_ptr<float>(),
-            (glm::vec3*)color.data_ptr<float>(), (glm::vec3*)normal.data_ptr<float>(), feature.data_ptr<float>(), depth.data_ptr<float>(), alpha.data_ptr<float>(), alpha_m2.data_ptr<float>(),
+            (glm::vec3*)color.data_ptr<float>(), (glm::vec3*)normal.data_ptr<float>(), feature.data_ptr<float>(), depth.data_ptr<float>(), alpha.data_ptr<float>(), alpha_m2.data_ptr<float>(), hit_idx_ptr,
             alpha_min, transmittance_min, deg, max_coeffs, back_culling, super_gaussian_order, first_hit_only, counters_ptr, stream);
     }
     

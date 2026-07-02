@@ -282,6 +282,15 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
     indirect_diffuse = ((f_d) * indirect_transport).mean(dim=-2)
     indirect_specular = ((f_s) * indirect_transport).mean(dim=-2)
 
+    # radiosity: replace the one-bounce diffuse INDIRECT with the multi-bounce solved indirect.
+    if getattr(pipe, 'use_radiosity_solve', False) and getattr(pc, '_radiosity_indirect', None) is not None:
+        rad_ind = pc._radiosity_indirect
+        ci = kwargs.get('chunk_idx', None)
+        if ci is not None:
+            rad_ind = rad_ind[ci:ci + base_color.shape[0]]
+        indirect_diffuse = rad_ind
+        diffuse = direct_diffuse + rad_ind
+
     if training:
         results = {
             "diffuse": diffuse,

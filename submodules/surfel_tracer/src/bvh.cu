@@ -193,14 +193,14 @@ public:
     void gaussian_trace_forward(
 		uint32_t n_elements, const int S, const glm::vec3* rays_o, const glm::vec3* rays_d, const int* gs_idxs, 
 		const glm::vec3* means3D, const float* opacity, const glm::vec3* ru, const glm::vec3* rv, const glm::vec3* normals, const float* features, const glm::vec3* shs, 
-		glm::vec3* color, glm::vec3* normal, float* feature, float* depth, float* alpha, float* alpha_m2,
+		glm::vec3* color, glm::vec3* normal, float* feature, float* depth, float* alpha, float* alpha_m2, int* hit_idx,
 		const float alpha_min, const float transmittance_min, const int deg, const int max_coeffs, const bool back_culling, const float super_gaussian_order, const bool first_hit_only, unsigned long long* counters, cudaStream_t stream
 	) override {
         m_optix.gaussiantrace_forward->invoke(
 			{
 				rays_o, rays_d, gs_idxs,
 				means3D, opacity, ru, rv, normals, features, shs,
-				color, normal, feature, depth, alpha, alpha_m2,
+				color, normal, feature, depth, alpha, alpha_m2, hit_idx,
 				alpha_min, transmittance_min, deg, max_coeffs, S, back_culling, super_gaussian_order, first_hit_only, counters, m_optix.gas->handle()
 			},
 			{n_elements, 1, 1}, 

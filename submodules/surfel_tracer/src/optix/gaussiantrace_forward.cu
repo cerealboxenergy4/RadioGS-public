@@ -24,6 +24,9 @@ extern "C" __global__ void __raygen__rg() {
 	// single-layer / first-hit instrumentation: per-ray accepted hits (k_eff) and candidate intersections.
 	unsigned int khit = 0, kcand = 0;
 
+	// radiosity: gs_idx of the first accepted surfel along this ray (-1 if the ray hits nothing).
+	int hit0 = -1;
+
 	HitInfo hitArray[MAX_BUFFER_SIZE];
 	unsigned int hitArrayPtr0 = (unsigned int)((uintptr_t)(&hitArray) & 0xFFFFFFFF);
     unsigned int hitArrayPtr1 = (unsigned int)(((uintptr_t)(&hitArray) >> 32) & 0xFFFFFFFF);
@@ -93,6 +96,9 @@ extern "C" __global__ void __raygen__rg() {
 
 				if (alpha<params.alpha_min) continue;
 
+				// radiosity: record the first surfel that passes back-culling + alpha acceptance.
+				if (hit0 < 0) hit0 = gs_idx;
+
 				glm::vec3 c = computeColorFromSH_forward(params.deg, ray_d, params.shs + gs_idx * params.max_coeffs);
 				if (params.back_culling){
 					c = (cos > 0) ? c : glm::vec3(0.0f, 0.0f, 0.0f);
@@ -134,6 +140,9 @@ extern "C" __global__ void __raygen__rg() {
 	params.depth[idx.x] = D;
 	params.alpha[idx.x] = O;
 	params.alpha_m2[idx.x] = M2;  // single-layer: k_eff surrogate second moment
+	if (params.hit_idx != nullptr){
+		params.hit_idx[idx.x] = hit0;  // radiosity: first-accepted surfel gs_idx (-1 if miss)
+	}
 	for (int i = 0; i < params.S; ++i){
 		params.feature[idx.x * params.S + i] = F[i];
 	}

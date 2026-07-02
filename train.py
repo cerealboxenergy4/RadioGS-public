@@ -120,14 +120,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         incident_directions, incident_areas = sample_incident_rays(normal_dummy, is_training=pipe.radiosity_random_sample, sample_num=pipe.diffuse_sample_num)
         gaussians.update_incidents_directions(incident_directions, incident_areas)
         gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=True, back_culling=pipe.back_culling)
-    
+
+    # radiosity: build the static transport matrix T once. Geometry is frozen in stage 2
+    # (lr_scale=0 => geometry LRs are 0, and the BVH is only updated when lr_scale>0), so T is
+    # valid for the whole run. An initial detached solve seeds _radiosity_indirect for iter 1.
+    if getattr(pipe, 'use_radiosity_solve', False):
+        gaussians.build_radiosity_transport(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
+        with torch.no_grad():
+            gaussians.solve_diffuse_radiosity(iters=pipe.radiosity_solver_iters, differentiable=False)
+
     while iteration < opt.iterations + 1:
         iter_start.record()
 
-        if iteration % opt.indirect_update_interval == 0: 
+        if iteration % opt.indirect_update_interval == 0:
             with torch.no_grad():
                 gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, back_culling=pipe.back_culling)
-        
+            if getattr(pipe, 'use_radiosity_solve', False) and pipe.radiosity_rebuild_interval > 0 \
+                    and iteration % pipe.radiosity_rebuild_interval == 0:
+                gaussians.build_radiosity_transport(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
+
+        # radiosity: multi-bounce diffuse solve feeding rendering_equation's indirect_diffuse.
+        # differentiable => re-solve every iter (fresh graph for backward); else detached refresh.
+        if getattr(pipe, 'use_radiosity_solve', False):
+            if pipe.radiosity_diff:
+                gaussians.solve_diffuse_radiosity(iters=pipe.radiosity_solver_iters, differentiable=True, add_specular=pipe.radiosity_spec_indirect)
+            elif iteration % opt.indirect_update_interval == 0:
+                with torch.no_grad():
+                    gaussians.solve_diffuse_radiosity(iters=pipe.radiosity_solver_iters, differentiable=False, add_specular=pipe.radiosity_spec_indirect)
+
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras(ratio=pipe.view_ratio).copy()

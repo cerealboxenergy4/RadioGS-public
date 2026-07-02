@@ -23,6 +23,7 @@ struct Gaussiantrace_forward {
 		float* depth;
 		float* alpha;
 		float* alpha_m2;                  // single-layer: per-ray second moment Sum_i w_i^2 (k_eff surrogate)
+		int* hit_idx;                     // radiosity: per-ray first-accepted surfel gs_idx (-1 if none), nullable
 		float alpha_min;
 		float transmittance_min;
 		int deg;
