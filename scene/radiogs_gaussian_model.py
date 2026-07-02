@@ -136,6 +136,7 @@ class GaussianModel:
         # first_hit_pbr: per-ray L_ind gathered at the first-hit surfel (PBR from the incident
         # cache), swapped in for the composited local_incident_lights when pipe.first_hit_pbr.
         self._first_hit_pbr_ind = None      # [N,S,3], detached
+        self._incident_hit_idx = None       # [N,S] first-hit surfel per incident ray (from precompute_incidents)
         
     @torch.no_grad()
     def set_transform(self, rotation=None, center=None, scale=None, offset=None, transform=None):
@@ -795,33 +796,40 @@ class GaussianModel:
         vertices_b, faces_b, gs_id = self.get_boundings(alpha_min=self.alpha_min)
         self.gaussian_tracer.update_bvh(vertices_b, faces_b, gs_id)
         
-    def trace(self, rays_o, rays_d, features=None, camera_center=None, back_culling=False, detach_orientation=False):
+    def trace(self, rays_o, rays_d, features=None, camera_center=None, back_culling=False, detach_orientation=False, return_hit_idx=False):
         means3D = self.get_xyz
         shs = self.get_features
         opacity = self.get_opacity
-        
+
         s = 1 / self.get_scaling
         R = build_rotation(self._rotation)
         ru = R[:, :, 0] * s[:,0:1]
         rv = R[:, :, 1] * s[:,1:2]
-        
+
         splat2world = self.get_covariance()
-        normals_raw = splat2world[: ,2, :3] 
+        normals_raw = splat2world[: ,2, :3]
         normals = safe_normalize(normals_raw)
-        
+
         sgo = getattr(self, "super_gaussian_order", 2.0)  # single-layer: ironed footprint order for the tracer
         fho = getattr(self, "first_hit_only", False)      # single-layer: first-hit trace mode (k_eff := 1)
-        if not detach_orientation: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
-        else: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
-        
+        # first_hit_pbr: the kernel already records each ray's first-accepted surfel while
+        # compositing, so return_hit_idx surfaces it for free (no second trace needed).
+        hit_idx = None
+        if not detach_orientation:
+            outs = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=return_hit_idx)
+        else:
+            outs = self.gaussian_tracer.trace(rays_o, rays_d, means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=return_hit_idx)
+        if return_hit_idx: color, normal, feature, depth, alpha, hit_idx = outs
+        else: color, normal, feature, depth, alpha = outs
+
         alpha_ = alpha[..., None]
         color = torch.where(alpha_ < 1 - self.gaussian_tracer.transmittance_min, color, color / alpha_)
         normal = torch.where(alpha_ < 1 - self.gaussian_tracer.transmittance_min, normal, normal / alpha_)
         feature = torch.where(alpha_ < 1 - self.gaussian_tracer.transmittance_min, feature, feature / alpha_)
         depth = torch.where(alpha < 1 - self.gaussian_tracer.transmittance_min, depth, depth / alpha)
         alpha = torch.where(alpha < 1 - self.gaussian_tracer.transmittance_min, alpha, torch.ones_like(alpha))
-        
-        return {
+
+        out = {
             "color": color,
             "normal": normal,
             "feature": feature,
@@ -829,6 +837,8 @@ class GaussianModel:
             "alpha" : alpha,
             "normals": normals,
         }
+        if return_hit_idx: out["hit_idx"] = hit_idx
+        return out
 
     def trace_keff(self, rays_o, rays_d, back_culling=False):
         """Differentiable trace returning only (trace_alpha=Sum w, trace_alpha_m2=Sum w^2) per ray,
@@ -1026,15 +1036,22 @@ class GaussianModel:
         self.get_envmap.build_mips()
         rough_all = self.get_rough                            # [N,1]
 
+        # Reuse the first-hit indices precompute_incidents already computed on these exact rays
+        # (same origins/dirs/light_t_min); fall back to a dedicated trace only if unavailable.
+        reuse = self._incident_hit_idx is not None and tuple(self._incident_hit_idx.shape[:2]) == (N, S)
+
         out = torch.zeros(N, S, 3, device=xyz.device)
-        chunk = max(1, 8_000_000 // S)  # bound rays per trace/FG-LUT call
+        chunk = max(1, 8_000_000 // S)  # bound the specular-env / FG-LUT work per iteration
         for lo in range(0, N, chunk):
             hi = min(lo + chunk, N)
             d = dirs[lo:hi]                                   # [n,S,3]
-            rays_o = xyz[lo:hi].unsqueeze(1) + d * light_t_min
-            hit, _ = self.trace_hit_idx(rays_o.reshape(-1, 3), d.reshape(-1, 3),
-                                        back_culling=back_culling)
-            j = hit.view(hi - lo, S).long()                   # [n,S]
+            if reuse:
+                j = self._incident_hit_idx[lo:hi].long()      # [n,S]
+            else:
+                rays_o = xyz[lo:hi].unsqueeze(1) + d * light_t_min
+                hit, _ = self.trace_hit_idx(rays_o.reshape(-1, 3), d.reshape(-1, 3),
+                                            back_culling=back_culling)
+                j = hit.view(hi - lo, S).long()               # [n,S]
             miss = j < 0
             jc = j.clamp(min=0)
             # (2) first-hit gather + split-sum env specular at the hit toward the receiver
@@ -1088,10 +1105,13 @@ class GaussianModel:
                 self.incident_radiance = local_incident_radiance
 
 
-    def precompute_incidents(self, light_t_min=0.0, only_vis=False, features=None, camera_center=None, back_culling=False, relight=False, f0=0.04):
+    def precompute_incidents(self, light_t_min=0.0, only_vis=False, features=None, camera_center=None, back_culling=False, relight=False, f0=0.04, return_hit_idx=False):
         if relight: assert features is not None
         position = self.get_xyz
-        trace_outputs = self.trace(position.unsqueeze(1) + self.incident_directions * light_t_min, self.incident_directions, features=features, camera_center=camera_center, back_culling=back_culling)
+        trace_outputs = self.trace(position.unsqueeze(1) + self.incident_directions * light_t_min, self.incident_directions, features=features, camera_center=camera_center, back_culling=back_culling, return_hit_idx=return_hit_idx)
+        # first_hit_pbr: stash the first-hit surfel index of these exact rays so
+        # precompute_first_hit_pbr can gather without re-tracing (same origins/dirs/light_t_min).
+        self._incident_hit_idx = trace_outputs['hit_idx'].detach() if return_hit_idx else None
         trace_alpha = trace_outputs['alpha'][..., None]
         incident_visibility = 1 - trace_alpha
 

@@ -202,7 +202,7 @@ if __name__ == '__main__':
                     incident_areas = 1 / incident_pdfs.clamp_min(1e-6)
                     gaussians.update_incidents_directions(incident_dirs, incident_areas)
                     features = torch.cat([gaussians.get_base_color * base_color_scale, gaussians.get_rough], dim=1)
-                    gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, features=features, relight=(not args.finetune), back_culling=pipe.back_culling)
+                    gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, features=features, relight=(not args.finetune), back_culling=pipe.back_culling, return_hit_idx=getattr(pipe, 'first_hit_pbr', False))
                     # radiosity: build T (light-independent geometry) and solve multi-bounce diffuse
                     # under THIS envmap. Replaces the one-bounce diffuse indirect; no per-env finetune.
                     if getattr(pipe, 'use_radiosity_solve', False):

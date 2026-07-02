@@ -119,7 +119,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_dummy = gaussians.get_normal(scaling_modifier=1.0, dir_pp_normalized=dir_pp_normalized)
         incident_directions, incident_areas = sample_incident_rays(normal_dummy, is_training=pipe.radiosity_random_sample, sample_num=pipe.diffuse_sample_num)
         gaussians.update_incidents_directions(incident_directions, incident_areas)
-        gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=True, back_culling=pipe.back_culling)
+        gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=True, back_culling=pipe.back_culling, return_hit_idx=getattr(pipe, 'first_hit_pbr', False))
 
     # radiosity: build the static transport matrix T once. Geometry is frozen in stage 2
     # (lr_scale=0 => geometry LRs are 0, and the BVH is only updated when lr_scale>0), so T is
@@ -139,7 +139,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if iteration % opt.indirect_update_interval == 0:
             with torch.no_grad():
-                gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, back_culling=pipe.back_culling)
+                gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, back_culling=pipe.back_culling, return_hit_idx=getattr(pipe, 'first_hit_pbr', False))
             if getattr(pipe, 'use_radiosity_solve', False) and pipe.radiosity_rebuild_interval > 0 \
                     and iteration % pipe.radiosity_rebuild_interval == 0:
                 gaussians.build_radiosity_transport(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
