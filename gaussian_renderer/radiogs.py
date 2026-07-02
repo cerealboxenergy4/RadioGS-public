@@ -263,16 +263,22 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
         rad_shs = pc.get_features
         rad_shs = rad_shs[sample_mask].transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
 
+        # fhpbr: hit indices from the subset's live trace are needed by the j-consistency loss
+        # and/or the per-iteration fhpbr buffer refresh (both default-off).
+        fhpbr_need_hits = (getattr(opt, 'lambda_fhpbr_j', 0.0) > 0) or \
+            (getattr(pipe, 'fhpbr_subset_refresh', False) and getattr(pipe, 'first_hit_pbr', False)
+             and getattr(pc, '_first_hit_pbr_ind', None) is not None)
         radiosity_result = rendering_equation_radiosity(
                             rad_base_color,
                             rad_roughness,
                             rad_normals,
                             rad_points,
                             rad_view,
-                            pc, pipe=pipe, 
+                            pc, pipe=pipe,
                             camera_center=viewpoint_camera.camera_center,
-                            training=training,)
-        
+                            training=training,
+                            return_hit_idx=fhpbr_need_hits)
+
         if opt.rad_update_indirect:
             diffuse_incident_dirs = radiosity_result['incident_dirs'][:, :pipe.radiosity_sample_num]
             diffuse_incident_areas = torch.ones_like(diffuse_incident_dirs)[..., 0:1] * 2 * np.pi
@@ -280,6 +286,51 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
             diffuse_incident_lights = radiosity_result['local_incident_lights'][:, :pipe.radiosity_sample_num]
             pc.update_incidents_directions(diffuse_incident_dirs, diffuse_incident_areas, mask=sample_mask)
             pc.update_incident_radiance(diffuse_visibility, diffuse_incident_lights, detach=opt.rad_render_detach, mask=sample_mask)
+
+            # fhpbr subset refresh: keep the fhpbr indirect buffer as fresh as the composited
+            # cache for the sampled subset — recompute its rows from this trace's hit indices +
+            # current caches (no extra rays). Must live inside rad_update_indirect so the rows
+            # pair with the directions just written by update_incidents_directions.
+            if (getattr(pipe, 'fhpbr_subset_refresh', False) and getattr(pipe, 'first_hit_pbr', False)
+                    and getattr(pc, '_first_hit_pbr_ind', None) is not None
+                    and 'hit_idx' in radiosity_result
+                    and pc._first_hit_pbr_ind.shape[1] == pipe.radiosity_sample_num):
+                with torch.no_grad():
+                    pc.get_envmap.build_mips()   # split-sum spec in the helper needs current mips
+                    hit_sub = radiosity_result['hit_idx'][:, :pipe.radiosity_sample_num]
+                    M_, S_ = hit_sub.shape
+                    j_flat = hit_sub.reshape(-1).long()
+                    wo_flat = -diffuse_incident_dirs.reshape(-1, 3)
+                    valid = j_flat >= 0
+                    L = torch.zeros(M_ * S_, 3, device=j_flat.device)
+                    if valid.any():
+                        L[valid] = pc.first_hit_pbr_outgoing(j_flat[valid], wo_flat[valid])
+                    pc._first_hit_pbr_ind[sample_mask] = L.view(M_, S_, 3) * (1 - diffuse_visibility)
+
+        # fhpbr j-consistency (single-layer surfel project): constrain the FIRST-HIT surfels of
+        # the subset's secondary rays, not just the sampled surfels themselves. LHS = the hit's
+        # SH radiance toward the receiver; RHS = its live first-hit PBR outgoing radiance — the
+        # exact quantity the fhpbr gather injects as L_ind. Transport-weighted: repeat hits
+        # count once per ray, and the constraint direction is the one transport queries. The
+        # gather's n_flip convention is kept (no extra NoV mask): with back_culling the hit
+        # population is front-facing, and any remaining flipped hits are constrained precisely
+        # because the gather does inject them.
+        if getattr(opt, 'lambda_fhpbr_j', 0.0) > 0 and 'hit_idx' in radiosity_result:
+            j_all = radiosity_result['hit_idx'][:, :pipe.radiosity_sample_num].reshape(-1).long()
+            d_all = radiosity_result['incident_dirs'][:, :pipe.radiosity_sample_num].reshape(-1, 3)
+            j_valid = j_all >= 0
+            if j_valid.any():
+                j_hit = j_all[j_valid]
+                d_hit = d_all[j_valid]           # receiver -> hit; also the SH eval direction
+                pc.get_envmap.build_mips()       # differentiable rebuild for the loss path
+                j_rhs = pc.first_hit_pbr_outgoing(
+                    j_hit, -d_hit,
+                    detach_env=pipe.detach_rad_global, detach_mat=pipe.detach_rad_mat)
+                shs_j = pc.get_features[j_hit].transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)
+                j_lhs = torch.clamp_min(eval_sh(pc.active_sh_degree, shs_j, d_hit) + 0.5, 0.0)
+                if pipe.detach_rad_lhs: j_lhs = j_lhs.detach()
+                if pipe.detach_rad_rhs: j_rhs = j_rhs.detach()
+                results.update({"fhpbr_j_lhs": j_lhs, "fhpbr_j_rhs": j_rhs})
 
         pbr_radiosity = radiosity_result['diffuse'] + radiosity_result['specular']
         nvs_radiosity = eval_sh(pc.active_sh_degree, rad_shs, -rad_view)
@@ -594,7 +645,7 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
     
     return results
 
-def rendering_equation_radiosity(base_color, roughness, normals, position, viewdirs, pc, pipe, f0=0.04, camera_center=None, precompute=False, **kwargs):
+def rendering_equation_radiosity(base_color, roughness, normals, position, viewdirs, pc, pipe, f0=0.04, camera_center=None, precompute=False, return_hit_idx=False, **kwargs):
     if not precompute:
         training=kwargs.get('training', False)
         with torch.no_grad():
@@ -607,7 +658,9 @@ def rendering_equation_radiosity(base_color, roughness, normals, position, viewd
                     normals, viewdirs, roughness, light_sample_num, diff_sample_num, spec_sample_num, pc, training=training and pipe.radiosity_random_sample)
 
             else: incident_dirs, incident_areas = sample_incident_rays(normals, pipe.radiosity_random_sample, pipe.radiosity_sample_num)
-        trace_outputs = pc.trace(position.unsqueeze(1)+incident_dirs*pipe.light_t_min, incident_dirs, features=None, camera_center=camera_center, detach_orientation=pipe.detach_orientation, back_culling=pipe.back_culling)
+        # fhpbr: the kernel records each ray's first-accepted surfel while compositing, so
+        # return_hit_idx surfaces the subset's hit indices for free (no second trace).
+        trace_outputs = pc.trace(position.unsqueeze(1)+incident_dirs*pipe.light_t_min, incident_dirs, features=None, camera_center=camera_center, detach_orientation=pipe.detach_orientation, back_culling=pipe.back_culling, return_hit_idx=return_hit_idx)
         incident_visibility = 1 - trace_outputs['alpha'][..., None]
         local_incident_lights = trace_outputs['color']
     else:
@@ -654,6 +707,8 @@ def rendering_equation_radiosity(base_color, roughness, normals, position, viewd
         "local_incident_lights": local_incident_lights,
         "global_incident_lights": global_incident_lights,
     }
+    if not precompute and return_hit_idx:
+        results["hit_idx"] = trace_outputs["hit_idx"]
     return results
 
 def GGX_specular(

@@ -473,10 +473,16 @@ def calculate_loss3(viewpoint_camera, pc, render_pkg, opt, iteration):
 
         tb_dict["loss_radiosity"] = loss_radiosity.item()
         loss = loss + opt.lambda_radiosity * loss_radiosity
-        # if opt.rad_only: 
+        # if opt.rad_only:
         #     tb_dict["loss"] = loss.item()
         #     return loss, tb_dict
 
+        # fhpbr j-consistency: same loss family, applied to the transport-selected first-hit
+        # surfels of the subset's secondary rays (see gaussian_renderer/radiogs.py).
+        if getattr(opt, 'lambda_fhpbr_j', 0.0) > 0 and 'fhpbr_j_lhs' in render_pkg:
+            loss_fhpbr_j = loss_fn(render_pkg['fhpbr_j_lhs'], render_pkg['fhpbr_j_rhs']).mean()
+            tb_dict["loss_fhpbr_j"] = loss_fhpbr_j.item()
+            loss = loss + opt.lambda_fhpbr_j * loss_fhpbr_j
 
     if opt.lambda_normal_render_depth > 0 and iteration > opt.normal_loss_start:
         surf_normal = render_pkg['surf_normal']

@@ -154,6 +154,11 @@ class PipelineParams(ParamGroup):
         # (+1 bounce depth, radiance-caching style). Only valid under near-single-layer (ironed)
         # geometry. See GaussianModel.precompute_first_hit_pbr. Default off.
         self.first_hit_pbr = False
+        # Per-iteration refresh of the fhpbr indirect buffer for the radiosity-sampled subset,
+        # reusing the subset's live trace hit indices (no extra rays). Closes the freshness gap
+        # vs the composited cache, which already gets the per-iteration subset update. Requires
+        # first_hit_pbr + use_radiosity + rad_update_indirect. Default off.
+        self.fhpbr_subset_refresh = False
 
         # ablation on view
         self.view_ratio = 1.0
@@ -215,6 +220,10 @@ class OptimizationParams(ParamGroup):
         self.dist_loss_start = 1000
         self.radiosity_loss_start = 0
         self.lambda_radiosity = 0.0
+        # fhpbr j-consistency: constrain the FIRST-HIT surfels of the subset's secondary rays
+        # (SH_j toward the receiver vs live first-hit PBR outgoing radiance — the quantity the
+        # fhpbr gather injects as L_ind). Transport-weighted sample placement. 0 == off.
+        self.lambda_fhpbr_j = 0.0
         self.rad_loss = 'l1'  # Options: l1, l2, relmse, smape
         self.weight_roughness = False
         self.rad_render_detach = 1

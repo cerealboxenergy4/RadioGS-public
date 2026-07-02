@@ -1079,6 +1079,52 @@ class GaussianModel:
         self._first_hit_pbr_ind = out.detach()
         return self._first_hit_pbr_ind
 
+    def first_hit_pbr_outgoing(self, j, wo, f0=0.04, detach_env=False, detach_mat=False):
+        """Differentiable outgoing radiance of first-hit surfels j toward wo — the same quantity
+        precompute_first_hit_pbr bakes per ray (diffuse_out_j from the hit's cached incident
+        light + split-sum env specular), recomputed live for (a) the fhpbr j-consistency loss
+        and (b) the per-iteration subset refresh of _first_hit_pbr_ind. Formulas mirror
+        precompute_first_hit_pbr exactly (incl. the n_flip convention); keep the two in sync.
+
+        j: [K] long indices of VALID hits (caller filters misses); wo: [K,3] unit directions
+        hit -> receiver. Caller must ensure envmap mips are current (get_envmap.build_mips()).
+        Returns [K,3]. detach_env/detach_mat mirror detach_rad_global/detach_rad_mat."""
+        normals = safe_normalize(self.get_covariance()[:, 2, :3])            # [N,3]
+        # (1) diffuse_out for the distinct hit surfels, from their cached incident light
+        uj, inv = torch.unique(j, return_inverse=True)
+        dirs_u = self.incident_directions[uj]                                # [U,S,3]
+        areas_u = self.incident_areas[uj]
+        vis_u = self.incident_visibility[uj]
+        env_u = self.get_envmap(dirs_u, mode='pure_env')
+        if detach_env: env_u = env_u.detach()
+        inc_u = vis_u * env_u + self.incident_radiance[uj]
+        albedo_u = self.get_base_color[uj]
+        if detach_mat: albedo_u = albedo_u.detach()
+        n_u = normals[uj]
+        n_d_i = (n_u.unsqueeze(1) * dirs_u).sum(-1, keepdim=True).clamp(min=0)
+        diffuse_out_u = (albedo_u / np.pi) * (inc_u * areas_u * n_d_i).mean(dim=-2)  # [U,3]
+        # (2) split-sum env specular at each hit toward wo (n_flip like the gather)
+        n_j = normals[j]
+        ndv = (n_j * wo).sum(-1, keepdim=True)
+        n_j = torch.where(ndv < 0, -n_j, n_j)
+        ndv = ndv.abs()
+        rough_j = self.get_rough[j]
+        if detach_mat: rough_j = rough_j.detach()
+        refl = safe_normalize(2 * ndv * n_j - wo)
+        fg_uv = torch.cat([ndv, rough_j], dim=-1).clamp(0, 1)
+        # batch the FG LUT lookup (single huge dr.texture calls trip the CUDA launch config)
+        fg_uv_flat = fg_uv.reshape(-1, 2)
+        fg_list = []
+        for fi in range(0, fg_uv_flat.shape[0], 100000):
+            batch_uv = fg_uv_flat[fi:fi + 100000]
+            fg_list.append(dr.texture(self.FG_LUT, batch_uv.reshape(1, -1, 1, 2).contiguous(),
+                                      filter_mode="linear", boundary_mode="clamp").reshape(-1, 2))
+        fg = torch.cat(fg_list, dim=0).reshape(*fg_uv.shape)
+        spec_env = self.get_envmap(refl, roughness=rough_j, mode='specular')
+        if detach_env: spec_env = spec_env.detach()
+        spec = spec_env * (f0 * fg[..., 0:1] + fg[..., 1:2])
+        return diffuse_out_u[inv] + spec
+
     def update_incidents_directions(self, incident_directions, incident_areas, mask=None):
         if mask is not None:
             assert mask.shape[0] == self.incident_directions.shape[0], "Mask must match the number of Gaussians {} vs {}".format(mask.shape[0], self.incident_directions.shape[0])
