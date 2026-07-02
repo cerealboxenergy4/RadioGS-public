@@ -1046,8 +1046,15 @@ class GaussianModel:
             rough_j = rough_all[jc]                           # [n,S,1]
             refl = safe_normalize(2 * ndv * n_j - wi)
             fg_uv = torch.cat([ndv, rough_j], dim=-1).clamp(0, 1)
-            fg = dr.texture(self.FG_LUT, fg_uv.reshape(1, -1, 1, 2).contiguous(),
-                            filter_mode="linear", boundary_mode="clamp").reshape(*fg_uv.shape)
+            # batch the FG LUT lookup like precompute_incidents does: a single dr.texture call
+            # over millions of points trips the CUDA launch configuration at eval sample counts
+            fg_uv_flat = fg_uv.reshape(-1, 2)
+            fg_list = []
+            for fi in range(0, fg_uv_flat.shape[0], 100000):
+                batch_uv = fg_uv_flat[fi:fi + 100000]
+                fg_list.append(dr.texture(self.FG_LUT, batch_uv.reshape(1, -1, 1, 2).contiguous(),
+                                          filter_mode="linear", boundary_mode="clamp").reshape(-1, 2))
+            fg = torch.cat(fg_list, dim=0).reshape(*fg_uv.shape)
             spec = self.get_envmap(refl, roughness=rough_j, mode='specular') * (f0 * fg[..., 0:1] + fg[..., 1:2])
             L = diffuse_out[jc] + spec                        # [n,S,3]
             L = torch.where(miss.unsqueeze(-1), torch.zeros_like(L), L)
