@@ -151,8 +151,11 @@ class PipelineParams(ParamGroup):
         # ---- first-hit PBR indirect (single-layer surfel project) ----
         # Replace the alpha-composited L_ind on secondary rays with the first-hit surfel's PBR
         # outgoing radiance, using the cached per-surfel incident light as its illumination
-        # (+1 bounce depth, radiance-caching style). Only valid under near-single-layer (ironed)
-        # geometry. See GaussianModel.precompute_first_hit_pbr. Default off.
+        # (+1 bounce depth, radiance-caching style). Measured (TensoIR hotdog, composite-trained
+        # models): the eval-time swap gains ~+0.15 dB relight on BOTH stock (k_eff~16) and ironed
+        # (k_eff~4.5) geometry — geometry-independent; training with it on instead COSTS quality,
+        # and more so on multi-layer geometry (-0.55 stock / -0.15 ironed). Prefer composite
+        # training + eval-time swap. See GaussianModel.precompute_first_hit_pbr. Default off.
         self.first_hit_pbr = False
         # Per-iteration refresh of the fhpbr indirect buffer for the radiosity-sampled subset,
         # reusing the subset's live trace hit indices (no extra rays). Closes the freshness gap
@@ -223,6 +226,8 @@ class OptimizationParams(ParamGroup):
         # fhpbr j-consistency: constrain the FIRST-HIT surfels of the subset's secondary rays
         # (SH_j toward the receiver vs live first-hit PBR outgoing radiance — the quantity the
         # fhpbr gather injects as L_ind). Transport-weighted sample placement. 0 == off.
+        # Measured net-NEGATIVE on ironed hotdog at 0.2 (with fhpbr_subset_refresh): −0.14/−0.22
+        # dB relight, uniform across envmaps — the stale-cache RHS biases SH. Kept for ablation.
         self.lambda_fhpbr_j = 0.0
         self.rad_loss = 'l1'  # Options: l1, l2, relmse, smape
         self.weight_roughness = False
