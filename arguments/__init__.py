@@ -148,6 +148,13 @@ class PipelineParams(ParamGroup):
         self.radiosity_spec_indirect = True  # add each hit's one-bounce specular to the gathered indirect
                                              # source (matches the baseline bounce energy; diffuse-only T)
 
+        # ---- first-hit PBR indirect (single-layer surfel project) ----
+        # Replace the alpha-composited L_ind on secondary rays with the first-hit surfel's PBR
+        # outgoing radiance, using the cached per-surfel incident light as its illumination
+        # (+1 bounce depth, radiance-caching style). Only valid under near-single-layer (ironed)
+        # geometry. See GaussianModel.precompute_first_hit_pbr. Default off.
+        self.first_hit_pbr = False
+
         # ablation on view
         self.view_ratio = 1.0
 

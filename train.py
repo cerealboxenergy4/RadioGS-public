@@ -129,6 +129,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         with torch.no_grad():
             gaussians.solve_diffuse_radiosity(iters=pipe.radiosity_solver_iters, differentiable=False)
 
+    # first_hit_pbr: seed the first-hit gathered L_ind so iter 1 renders with it (the incident
+    # cache holds visibility only at this point => shadowed direct diffuse at the hits).
+    if getattr(pipe, 'first_hit_pbr', False):
+        gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
+
     while iteration < opt.iterations + 1:
         iter_start.record()
 
@@ -138,6 +143,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if getattr(pipe, 'use_radiosity_solve', False) and pipe.radiosity_rebuild_interval > 0 \
                     and iteration % pipe.radiosity_rebuild_interval == 0:
                 gaussians.build_radiosity_transport(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
+            # first_hit_pbr: re-gather the per-ray first-hit L_ind from the refreshed cache
+            # (each refresh deepens the effective bounce depth by one).
+            if getattr(pipe, 'first_hit_pbr', False):
+                gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
 
         # radiosity: multi-bounce diffuse solve feeding rendering_equation's indirect_diffuse.
         # differentiable => re-solve every iter (fresh graph for backward); else detached refresh.

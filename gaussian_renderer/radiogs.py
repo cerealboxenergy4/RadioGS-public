@@ -515,7 +515,16 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
         local_incident_lights = local_incident_lights[chunk_idx:chunk_idx+CHUNK_SIZE]
     global_incident_lights = envmap(incident_dirs, mode='pure_env')
 
-    if relight:
+    # first_hit_pbr: swap in the pre-gathered first-hit L_ind (see precompute_first_hit_pbr).
+    # Supersedes both the composited cache radiance and the live relight trace below; the cached
+    # incident_visibility already holds 1 - full-composite alpha, so the vis*env split is intact.
+    first_hit_pbr_on = getattr(pipe, 'first_hit_pbr', False) and getattr(pc, '_first_hit_pbr_ind', None) is not None
+    if first_hit_pbr_on:
+        local_incident_lights = pc._first_hit_pbr_ind.clone()
+        if chunk_idx is not None:
+            local_incident_lights = local_incident_lights[chunk_idx:chunk_idx+CHUNK_SIZE]
+
+    if relight and not first_hit_pbr_on:
         features = torch.cat([pc.get_base_color, pc.get_rough], dim=1)
         trace_outputs = pc.trace(position.unsqueeze(1)+incident_dirs*pipe.light_t_min, incident_dirs, features=features, camera_center=camera_center, back_culling=pipe.back_culling)
         trace_alpha = trace_outputs['alpha'][..., None]

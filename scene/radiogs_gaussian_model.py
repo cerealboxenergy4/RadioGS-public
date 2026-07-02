@@ -132,6 +132,10 @@ class GaussianModel:
         self.radiosity_Tt = None
         self._radiosity_L = None            # per-surfel total diffuse radiance (warm start / viz)
         self._radiosity_indirect = None     # per-surfel diffuse INDIRECT injected into the render [N,3]
+
+        # first_hit_pbr: per-ray L_ind gathered at the first-hit surfel (PBR from the incident
+        # cache), swapped in for the composited local_incident_lights when pipe.first_hit_pbr.
+        self._first_hit_pbr_ind = None      # [N,S,3], detached
         
     @torch.no_grad()
     def set_transform(self, rotation=None, center=None, scale=None, offset=None, transform=None):
@@ -976,6 +980,80 @@ class GaussianModel:
         self._radiosity_indirect = indirect if differentiable else indirect.detach()
         self._radiosity_L = L.detach()
         return self._radiosity_indirect
+
+    @torch.no_grad()
+    def precompute_first_hit_pbr(self, light_t_min=0.05, back_culling=False, f0=0.04,
+                                 base_color_scale=1.0):
+        """first_hit_pbr: rebuild the per-ray indirect light under the single-layer assumption.
+        For every cached incident ray, gather its FIRST-HIT surfel j (trace_hit_idx) and evaluate
+        j's PBR outgoing radiance toward the receiver, instead of alpha-compositing all surfels
+        the ray intersects:
+
+            L_ind(i,s) = alpha(i,s) * [ diffuse_out(j) + spec_env(j, -dir_{i,s}) ]
+
+        diffuse_out(j) = (albedo_j/pi) * mean_s'((vis*L_env + incident_radiance)*area*cos) uses
+        the hit's own cached incident light (SH-composited at train, env-PBR at relight eval), so
+        each cache refresh deepens the effective bounce depth by one. spec_env is the same
+        split-sum env specular the relight branch uses, but with the hit surfel's TRUE
+        normal/material rather than a transmittance-weighted composite. alpha = 1 - cached
+        incident_visibility (full-composite), keeping the vis*env + L_ind energy split identical
+        to the baseline. Requires update_incidents_directions / precompute_incidents first.
+        """
+        assert self.incident_directions.numel() > 0, \
+            "incident rays must be sampled first (update_incidents_directions / precompute_incidents)"
+        N = self.get_xyz.shape[0]
+        S = self.incident_directions.shape[1]
+        xyz = self.get_xyz
+        dirs = self.incident_directions                       # [N,S,3]
+        areas = self.incident_areas                           # [N,S,1]
+        vis = self.incident_visibility                        # [N,S,1]
+        splat2world = self.get_covariance()
+        normals = safe_normalize(splat2world[:, 2, :3])       # [N,3]
+
+        albedo = self.get_base_color
+        if not isinstance(base_color_scale, float):
+            albedo = albedo * base_color_scale[None, :]
+        elif base_color_scale != 1.0:
+            albedo = albedo * base_color_scale
+
+        # (1) per-surfel outgoing diffuse from the cached incident light (the "+1 depth" source)
+        n_d_i = (normals.unsqueeze(1) * dirs).sum(-1, keepdim=True).clamp(min=0)      # [N,S,1]
+        inc = vis * self.get_envmap(dirs, mode='pure_env') + self.incident_radiance   # [N,S,3]
+        diffuse_out = (albedo / np.pi) * (inc * areas * n_d_i).mean(dim=-2)           # [N,3]
+
+        # Specular mips are not maintained during stage-2 training (the main render only queries
+        # 'pure_env'); rebuild them so the split-sum proxy works in train and eval alike.
+        self.get_envmap.build_mips()
+        rough_all = self.get_rough                            # [N,1]
+
+        out = torch.zeros(N, S, 3, device=xyz.device)
+        chunk = max(1, 8_000_000 // S)  # bound rays per trace/FG-LUT call
+        for lo in range(0, N, chunk):
+            hi = min(lo + chunk, N)
+            d = dirs[lo:hi]                                   # [n,S,3]
+            rays_o = xyz[lo:hi].unsqueeze(1) + d * light_t_min
+            hit, _ = self.trace_hit_idx(rays_o.reshape(-1, 3), d.reshape(-1, 3),
+                                        back_culling=back_culling)
+            j = hit.view(hi - lo, S).long()                   # [n,S]
+            miss = j < 0
+            jc = j.clamp(min=0)
+            # (2) first-hit gather + split-sum env specular at the hit toward the receiver
+            n_j = normals[jc]                                 # [n,S,3]
+            wi = -d
+            ndv = (n_j * wi).sum(-1, keepdim=True)
+            n_j = torch.where(ndv < 0, -n_j, n_j)             # face the incoming ray (kernel n_flip)
+            ndv = ndv.abs()
+            rough_j = rough_all[jc]                           # [n,S,1]
+            refl = safe_normalize(2 * ndv * n_j - wi)
+            fg_uv = torch.cat([ndv, rough_j], dim=-1).clamp(0, 1)
+            fg = dr.texture(self.FG_LUT, fg_uv.reshape(1, -1, 1, 2).contiguous(),
+                            filter_mode="linear", boundary_mode="clamp").reshape(*fg_uv.shape)
+            spec = self.get_envmap(refl, roughness=rough_j, mode='specular') * (f0 * fg[..., 0:1] + fg[..., 1:2])
+            L = diffuse_out[jc] + spec                        # [n,S,3]
+            L = torch.where(miss.unsqueeze(-1), torch.zeros_like(L), L)
+            out[lo:hi] = L * (1 - vis[lo:hi])                 # scale by full-composite alpha
+        self._first_hit_pbr_ind = out.detach()
+        return self._first_hit_pbr_ind
 
     def update_incidents_directions(self, incident_directions, incident_areas, mask=None):
         if mask is not None:

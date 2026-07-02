@@ -210,6 +210,13 @@ if __name__ == '__main__':
                         gaussians.solve_diffuse_radiosity(iters=pipe.radiosity_solver_iters,
                                                           base_color_scale=base_color_scale, differentiable=False,
                                                           add_specular=pipe.radiosity_spec_indirect)
+                    # first_hit_pbr: gather each ray's first-hit surfel PBR radiance from the
+                    # env-PBR cache just filled above (+1 bounce depth); replaces the live
+                    # composite trace inside rendering_equation for this envmap.
+                    if getattr(pipe, 'first_hit_pbr', False):
+                        gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min,
+                                                           back_culling=pipe.back_culling,
+                                                           base_color_scale=base_color_scale)
 
             with torch.no_grad():
                 render_pkg = render_radiogs(viewpoint_camera=custom_cam, **render_kwargs)
