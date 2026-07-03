@@ -222,6 +222,13 @@ if __name__ == '__main__':
                         gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min,
                                                            back_culling=pipe.back_culling,
                                                            base_color_scale=base_color_scale)
+                    # P3 cache_view_independent: bake every view-independent shading term for
+                    # THIS envmap (must run after the incident/fhpbr/radiosity precomputes above,
+                    # whose outputs it consumes); per frame only GGX specular is evaluated.
+                    if getattr(pipe, 'cache_view_independent', False):
+                        from gaussian_renderer.radiogs import build_eval_shading_cache
+                        build_eval_shading_cache(gaussians, pipe,
+                                                 base_color=gaussians.get_base_color * base_color_scale)
 
             with torch.no_grad():
                 render_pkg = render_radiogs(viewpoint_camera=custom_cam, **render_kwargs)

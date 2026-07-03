@@ -163,6 +163,16 @@ class PipelineParams(ParamGroup):
         # first_hit_pbr + use_radiosity + rad_update_indirect. Default off.
         self.fhpbr_subset_refresh = False
 
+        # ---- P3 shading-cost levers (single-layer surfel project) ----
+        # Shade only surfels that pass-1 rasterization actually blended (surfel_contrib > 0).
+        # Exact, not an approximation: pass 2 composites identical geometry/opacity/sort, so
+        # zero-contribution surfels receive exactly zero dL/dcolor. Default off.
+        self.shade_visible_only = False
+        # Relight-eval-only: cache every view-independent piece of rendering_equation per envmap
+        # (transports, diffuse, visibility/light means); per frame only GGX specular is evaluated.
+        # Built by build_eval_shading_cache in eval_relighting_tensoir.py. Default off.
+        self.cache_view_independent = False
+
         # ablation on view
         self.view_ratio = 1.0
 
