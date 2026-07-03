@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import calculate_loss2, calculate_loss3, keff_loss, scheduled_weight
+from utils.loss_utils import calculate_loss2, calculate_loss3, keff_loss, alpha_binary_loss, scheduled_weight
 from gaussian_renderer import render_radiogs
 import sys
 from scene import Scene, RadioGSModel
@@ -169,17 +169,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total_loss, tb_dict = calculate_loss3(viewpoint_cam, gaussians, render_pkg, opt, iteration)
         dist_loss, normal_loss, loss = tb_dict["loss_dist"], tb_dict["loss_normal_render_depth"], tb_dict["loss"]
 
-        # ---- single-layer trace-ray k_eff loss (stage-2 analog of stage-1 N_eff single_layer_loss) ----
+        # ---- single-layer trace-ray losses: k_eff (layer count) and alpha-binary (opacity
+        # binarization). Both consume the same sampled ray batch and trace; either lambda alone
+        # enables the block, and each term is added only when its own weight is positive. ----
         keff_w = scheduled_weight(opt.lambda_keff, iteration, opt.keff_warmup_iters,
                                   opt.keff_ramp_iters, opt.keff_until_iter, opt.keff_decay_iters)
-        if keff_w > 0.0 and (iteration % max(1, opt.keff_interval) == 0):
+        ab_w = scheduled_weight(opt.lambda_alpha_binary, iteration, opt.keff_warmup_iters,
+                                opt.keff_ramp_iters, opt.keff_until_iter, opt.keff_decay_iters)
+        if (keff_w > 0.0 or ab_w > 0.0) and (iteration % max(1, opt.keff_interval) == 0):
             rays_o_k, rays_d_k = sample_keff_rays(gaussians, opt.keff_n_surfels, opt.keff_n_dirs, opt.keff_offset_scale)
             trace_alpha, trace_alpha_m2 = gaussians.trace_keff(rays_o_k, rays_d_k, back_culling=pipe.back_culling)
-            keff_raw, keff_mean, keff_hit = keff_loss(trace_alpha, trace_alpha_m2, opt.keff_alpha_thresh)
-            total_loss = total_loss + keff_w * keff_raw
-            tb_dict["loss_keff"] = float(keff_raw.detach())
-            tb_dict["keff_mean"] = float(keff_mean)
-            tb_dict["keff_hit_frac"] = float(keff_hit)
+            if keff_w > 0.0:
+                keff_raw, keff_mean, keff_hit = keff_loss(trace_alpha, trace_alpha_m2, opt.keff_alpha_thresh)
+                total_loss = total_loss + keff_w * keff_raw
+                tb_dict["loss_keff"] = float(keff_raw.detach())
+                tb_dict["keff_mean"] = float(keff_mean)
+                tb_dict["keff_hit_frac"] = float(keff_hit)
+            if ab_w > 0.0:
+                ab_raw, alpha_hit_mean, ab_hit = alpha_binary_loss(trace_alpha, opt.keff_alpha_thresh)
+                total_loss = total_loss + ab_w * ab_raw
+                tb_dict["loss_alpha_binary"] = float(ab_raw.detach())
+                tb_dict["alpha_hit_mean"] = float(alpha_hit_mean)
+                tb_dict["alpha_hit_frac"] = float(ab_hit)
 
         total_loss.backward()
             

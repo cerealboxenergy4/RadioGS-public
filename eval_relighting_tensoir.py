@@ -54,7 +54,12 @@ if __name__ == '__main__':
 
     # load gaussians
     # 
-    gaussians = RadioGSModel(3)
+    # single-layer: plumb the (pre-existing) transmittance_min flag — the tracer terminates a
+    # secondary ray once composite alpha reaches 1 - transmittance_min and renormalizes it as
+    # opaque. Raising it (e.g. 0.5) approximates "terminate at the first significant surfel":
+    # measured on ironed hotdog, the first ACCEPTED hit is a low-alpha fringe (median 0.075)
+    # while the composite is ~0.98, which is why plain first_hit_only leaks energy.
+    gaussians = RadioGSModel(3, transmittance_min=dataset.transmittance_min)
     gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
     gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
     # single-layer: turn on trace-cost instrumentation (mean k_eff = accepted hits / ray).
@@ -265,6 +270,7 @@ if __name__ == '__main__':
     results_dict["trace_cost"] = {"k_eff": keff, "candidates_per_ray": cand_per_ray, "n_rays": n_rays,
                                   "first_hit_only": bool(gaussians.first_hit_only),
                                   "super_gaussian_order": float(gaussians.super_gaussian_order),
+                                  "transmittance_min": float(gaussians.gaussian_tracer.transmittance_min),
                                   "n_surfels": int(gaussians.get_xyz.shape[0])}
     print("[trace-cost] k_eff(mean accepted hits/ray)={:.4f}  candidates/ray={:.4f}  rays={}  "
           "first_hit_only={}  order={}  N_surfel={}".format(
