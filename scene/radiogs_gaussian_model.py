@@ -889,6 +889,50 @@ class GaussianModel:
         return hit_idx, alpha
 
     @torch.no_grad()
+    def trace_prefix(self, rays_o, rays_d, back_culling=False, n_prefix=8):
+        """virtual-surfel: per-ray significant-hit prefix — the first n_prefix accepted surfels
+        (gs_idx, w=T*alpha) in front-to-back order, truncated at the tracer's transmittance_min
+        (so a raised t_min yields exactly the "significant prefix"). prefix_idx[...,0] == the
+        first-accepted surfel (== trace_hit_idx). first_hit_only is forced off (the prefix is
+        meaningless when the ray stops at hit 0). Geometry-only, no_grad."""
+        means3D = self.get_xyz
+        shs = self.get_features
+        opacity = self.get_opacity
+
+        s = 1 / self.get_scaling
+        R = build_rotation(self._rotation)
+        ru = R[:, :, 0] * s[:, 0:1]
+        rv = R[:, :, 1] * s[:, 1:2]
+
+        splat2world = self.get_covariance()
+        normals = safe_normalize(splat2world[:, 2, :3])
+
+        sgo = getattr(self, "super_gaussian_order", 2.0)
+        _, _, _, _, _, prefix_idx, prefix_w = self.gaussian_tracer.trace(
+            rays_o, rays_d, means3D, opacity, ru, rv, normals, None, shs,
+            alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling,
+            super_gaussian_order=sgo, first_hit_only=False, return_prefix=True, n_prefix=n_prefix)
+        return prefix_idx, prefix_w
+
+    def _split_sum_spec(self, n_j, rough_j, wi, f0=0.04):
+        """Split-sum env specular of surfels (normals n_j [...,3], roughness rough_j [...,1]) toward
+        view dir wi [...,3]. Mirrors the inline specular in precompute_first_hit_pbr / the fhpbr
+        gather exactly (n_flip toward wi, mirror reflection, batched FG-LUT, prefiltered env)."""
+        ndv = (n_j * wi).sum(-1, keepdim=True)
+        n_j = torch.where(ndv < 0, -n_j, n_j)                 # face the receiver (kernel n_flip)
+        ndv = ndv.abs()
+        refl = safe_normalize(2 * ndv * n_j - wi)
+        fg_uv = torch.cat([ndv, rough_j], dim=-1).clamp(0, 1)
+        fg_uv_flat = fg_uv.reshape(-1, 2)
+        fg_list = []
+        for fi in range(0, fg_uv_flat.shape[0], 100000):
+            batch_uv = fg_uv_flat[fi:fi + 100000]
+            fg_list.append(dr.texture(self.FG_LUT, batch_uv.reshape(1, -1, 1, 2).contiguous(),
+                                      filter_mode="linear", boundary_mode="clamp").reshape(-1, 2))
+        fg = torch.cat(fg_list, dim=0).reshape(*fg_uv.shape)
+        return self.get_envmap(refl, roughness=rough_j, mode='specular') * (f0 * fg[..., 0:1] + fg[..., 1:2])
+
+    @torch.no_grad()
     def build_radiosity_transport(self, light_t_min=0.05, back_culling=False, chunk=100000, drop_self=True):
         """Radiosity: assemble the STATIC sparse transport matrix T [N,N] from the cached
         incident rays and their first-hit surfel indices. Geometry-only / light-independent,
@@ -993,8 +1037,24 @@ class GaussianModel:
 
     @torch.no_grad()
     def precompute_first_hit_pbr(self, light_t_min=0.05, back_culling=False, f0=0.04,
-                                 base_color_scale=1.0):
+                                 base_color_scale=1.0, hit_mode='first_accepted', n_prefix=8, toksvig=1.0):
         """first_hit_pbr: rebuild the per-ray indirect light under the single-layer assumption.
+
+        hit_mode selects the outgoing-radiance estimator O_hat; all modes share the SAME energy
+        split L_ind(i,s) = (1 - vis(i,s)) * O_hat, so they are directly comparable (only the
+        estimate of the occluder's outgoing radiance toward the receiver changes):
+          'first_accepted'   - single gather at the first-accepted surfel (original fhpbr; default,
+                               reuses the cached _incident_hit_idx, byte-identical to before).
+          'argmax'           - single gather at the max-weight (dominant) surfel of the ray's
+                               significant-hit prefix — "first significant hit" for fhpbr.
+          'virtual'          - single gather at a prefiltered virtual surfel: transmittance-weighted
+                               mean albedo & face-consistent mean normal, Toksvig-widened roughness
+                               (normal-variance -> roughness), diffuse irradiance from the dominant
+                               surfel (co-location approx). One PBR eval.
+          'prefix_composite' - transmittance-weighted composite of per-surfel PBR outgoing over the
+                               prefix (reference; K PBR evals/ray). On truly single-layer geometry
+                               all four converge (w_dominant -> 1); the gaps measure residual
+                               non-single-layer-ness.
         For every cached incident ray, gather its FIRST-HIT surfel j (trace_hit_idx) and evaluate
         j's PBR outgoing radiance toward the receiver, instead of alpha-compositing all surfels
         the ray intersects:
@@ -1029,12 +1089,79 @@ class GaussianModel:
         # (1) per-surfel outgoing diffuse from the cached incident light (the "+1 depth" source)
         n_d_i = (normals.unsqueeze(1) * dirs).sum(-1, keepdim=True).clamp(min=0)      # [N,S,1]
         inc = vis * self.get_envmap(dirs, mode='pure_env') + self.incident_radiance   # [N,S,3]
-        diffuse_out = (albedo / np.pi) * (inc * areas * n_d_i).mean(dim=-2)           # [N,3]
+        irradiance = (inc * areas * n_d_i).mean(dim=-2)                               # [N,3] (diffuse_out sans albedo/pi)
+        diffuse_out = (albedo / np.pi) * irradiance                                   # [N,3]
 
         # Specular mips are not maintained during stage-2 training (the main render only queries
         # 'pure_env'); rebuild them so the split-sum proxy works in train and eval alike.
         self.get_envmap.build_mips()
         rough_all = self.get_rough                            # [N,1]
+
+        # -------- prefix-based estimators (argmax / virtual / prefix_composite) --------
+        # These consume the ray's significant-hit PREFIX (trace_prefix) rather than the single
+        # first-accepted index. Early-return so the default 'first_accepted' path below is untouched.
+        if hit_mode != 'first_accepted':
+            assert hit_mode in ('argmax', 'virtual', 'prefix_composite'), f"unknown fhpbr hit_mode {hit_mode}"
+            K = int(n_prefix)
+            out = torch.zeros(N, S, 3, device=xyz.device)
+            # bound specular work per chunk (prefix_composite shades K lobes/ray, the rest 1)
+            chunk = max(1, 8_000_000 // (S * (K if hit_mode == 'prefix_composite' else 1)))
+            for lo in range(0, N, chunk):
+                hi = min(lo + chunk, N)
+                n = hi - lo
+                d = dirs[lo:hi]                               # [n,S,3]
+                wi = -d                                      # hit -> receiver view direction (per ray)
+                rays_o = xyz[lo:hi].unsqueeze(1) + d * light_t_min
+                pidx, pw = self.trace_prefix(rays_o.reshape(-1, 3), d.reshape(-1, 3),
+                                             back_culling=back_culling, n_prefix=K)
+                pidx = pidx.view(n, S, K).long()             # [n,S,K], -1 = empty slot
+                pw = pw.view(n, S, K)                         # [n,S,K] composite weights T*alpha
+                valid = pidx >= 0                             # [n,S,K]
+                wv = pw * valid                               # zero the empty slots
+                wsum = wv.sum(-1, keepdim=True)               # [n,S,1]
+                ray_ok = (wsum.squeeze(-1) > 0)              # [n,S] any valid hit
+                pj = pidx.clamp(min=0)                        # safe gather index
+                wn = wv / wsum.clamp_min(1e-12)               # normalized weights [n,S,K]
+                # dominant (max-weight) surfel per ray = "first significant hit"
+                a = torch.where(valid, pw, torch.full_like(pw, -1.0)).argmax(dim=-1)   # [n,S]
+                jstar = torch.gather(pj, -1, a.unsqueeze(-1)).squeeze(-1)              # [n,S]
+
+                if lo == 0 and os.environ.get('FHPBR_DEBUG'):
+                    kused = valid.sum(-1).float()
+                    msg = (f"[fhpbr {hit_mode}] chunk0 rays={n*S} valid_rays={ray_ok.float().mean():.3f} "
+                           f"K_used mean={kused[ray_ok].mean():.2f} max={int(kused.max())} "
+                           f"argmax!=slot0 frac={(a[ray_ok]!=0).float().mean():.3f}")
+                    if self._incident_hit_idx is not None and self._incident_hit_idx.shape[:2] == (N, S):
+                        inv = (pidx[..., 0] == self._incident_hit_idx[lo:hi])[ray_ok].float().mean()
+                        msg += f" prefix[0]==hit_idx frac={inv:.4f}"
+                    print(msg, flush=True)
+
+                if hit_mode == 'argmax':
+                    O_hat = diffuse_out[jstar] + self._split_sum_spec(normals[jstar], rough_all[jstar], wi, f0)
+                elif hit_mode == 'prefix_composite':
+                    jf = pj.reshape(-1)                       # [n*S*K]
+                    wi_k = wi.unsqueeze(2).expand(n, S, K, 3).reshape(-1, 3)
+                    spec_k = self._split_sum_spec(normals[jf], rough_all[jf], wi_k, f0).view(n, S, K, 3)
+                    out_k = diffuse_out[jf].view(n, S, K, 3) + spec_k
+                    O_hat = (wn.unsqueeze(-1) * out_k).sum(dim=2)   # [n,S,3]
+                else:  # virtual surfel: prefilter attributes, one PBR eval
+                    abar = (wn.unsqueeze(-1) * albedo[pj]).sum(dim=2)              # [n,S,3] weighted-mean albedo
+                    nk = normals[pj]                                              # [n,S,K,3]
+                    sgn = (nk * wi.unsqueeze(2)).sum(-1, keepdim=True)
+                    nk = torch.where(sgn < 0, -nk, nk)                            # face wi before averaging
+                    nsum = (wn.unsqueeze(-1) * nk).sum(dim=2)                     # [n,S,3]
+                    rho = nsum.norm(dim=-1, keepdim=True).clamp(max=1.0)         # Toksvig normal length in [0,1]
+                    nbar = nsum / nsum.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                    rbar = (wn.unsqueeze(-1) * rough_all[pj]).sum(dim=2)         # [n,S,1] weighted-mean roughness
+                    # widen roughness by the normal variance (Toksvig/LEAN); no-op when normals agree (rho->1)
+                    r_eff = torch.sqrt((rbar * rbar + toksvig * (1.0 - rho)).clamp(0.0, 1.0))
+                    diffuse_v = (abar / np.pi) * irradiance[jstar]               # dominant surfel's irradiance
+                    O_hat = diffuse_v + self._split_sum_spec(nbar, r_eff, wi, f0)
+
+                O_hat = torch.where(ray_ok.unsqueeze(-1), O_hat, torch.zeros_like(O_hat))
+                out[lo:hi] = O_hat * (1 - vis[lo:hi])         # same energy split as first_accepted
+            self._first_hit_pbr_ind = out.detach()
+            return self._first_hit_pbr_ind
 
         # Reuse the first-hit indices precompute_incidents already computed on these exact rays
         # (same origins/dirs/light_t_min); fall back to a dedicated trace only if unavailable.
