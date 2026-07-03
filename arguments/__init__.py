@@ -163,6 +163,22 @@ class PipelineParams(ParamGroup):
         # first_hit_pbr + use_radiosity + rad_update_indirect. Default off.
         self.fhpbr_subset_refresh = False
 
+        # ---- P1 transport-graph trace-free inner loop (single-layer surfel project) ----
+        # Exploit near-static hit topology (stage-2 geometry at lr_scale~0.01) + single-layer
+        # geometry (first-hit ~ composite): rotate ALL incident direction sets at each
+        # indirect_update_interval refresh (stock code only ever resamples the per-iteration
+        # 2048-subset, reaching a surfel every ~N/2048 iters), feed the radiometric-consistency
+        # loss from the CACHED rows, and drop the per-iteration differentiable subset trace.
+        self.transport_graph = False
+        # Increment 3: recompute the subset's L_ind differentiably as (1-vis) * SH(hit_idx, dir)
+        # gathered at the frozen first-hit index — restores the occluder-SH gradient path the
+        # live trace provided, attributed to one surfel per ray (the single-layer premise).
+        self.transport_graph_diff_gather = False
+        # Increment-1-only ablation: resample all direction sets at refresh but KEEP the live
+        # subset trace + row writes (isolates the direction-rotation effect). Implied by
+        # transport_graph.
+        self.transport_graph_rotate_all = False
+
         # ---- P3 shading-cost levers (single-layer surfel project) ----
         # Shade only surfels that pass-1 rasterization actually blended (surfel_contrib > 0).
         # Exact, not an approximation: pass 2 composites identical geometry/opacity/sort, so
