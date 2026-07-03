@@ -228,7 +228,16 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
         return results
     
     results = {}
-    
+
+    # P3 shade_visible_only: shade only surfels that pass-1 actually blended somewhere.
+    # surfel_contrib[g] is the per-Gaussian MAX blend weight over all pixels (> 0 iff g survived
+    # every per-pixel cull). Pass 2 composites identical geometry/opacity/sort, so surfels with
+    # zero pass-1 contribution receive exactly zero dL/dcolor in pass 2 — skipping their shading
+    # is exact, not an approximation. shade_idx=None keeps the stock full-N path byte-identical.
+    shade_idx = None
+    if getattr(pipe, 'shade_visible_only', False):
+        shade_idx = torch.nonzero(surfel_contrib > 0, as_tuple=False).squeeze(1)
+
     # calculate per-Gaussian radiometric consistency
     use_radiosity = pipe.use_radiosity
     if training and use_radiosity:
@@ -390,16 +399,36 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
 
     
     # render per-Gaussian radiance
+    # P3 shade_visible_only: shading runs on shade_idx rows only; results are scattered back
+    # into full-N zero tensors so both the second rasterization and every downstream consumer
+    # see the usual [N, C] layout.
     if training:
-        render_results = rendering_equation(base_color, roughness, normal, means3D, -dir_pp_normalized, pc, pipe=pipe, training=training, camera_center=viewpoint_camera.camera_center)
-        diffuse = render_results['diffuse']
-        specular = render_results['specular']
-        light_direct = render_results['light_direct']
+        if shade_idx is not None:
+            diffuse = torch.zeros_like(base_color)
+            specular = torch.zeros_like(base_color)
+            if shade_idx.numel() > 0:
+                render_results = rendering_equation(base_color[shade_idx], roughness[shade_idx], normal[shade_idx], means3D[shade_idx], -dir_pp_normalized[shade_idx], pc, pipe=pipe, training=training, camera_center=viewpoint_camera.camera_center, row_idx=shade_idx)
+                diffuse[shade_idx] = render_results['diffuse']
+                specular[shade_idx] = render_results['specular']
+            # lambda_light consumes per-surfel light_direct over ALL N (its mean enters the
+            # loss), so keep it full-N: a plain env lookup, none of the transport/GGX work.
+            light_direct = pc.get_envmap(pc.get_incident_directions, mode='pure_env').mean(dim=1)
+        else:
+            render_results = rendering_equation(base_color, roughness, normal, means3D, -dir_pp_normalized, pc, pipe=pipe, training=training, camera_center=viewpoint_camera.camera_center)
+            diffuse = render_results['diffuse']
+            specular = render_results['specular']
+            light_direct = render_results['light_direct']
         pbr_features = torch.cat([diffuse, specular], dim=-1) # (N, 9)
     else:
+        if shade_idx is not None:
+            chunks = [(shade_idx[i:i+CHUNK_SIZE], {'row_idx': shade_idx[i:i+CHUNK_SIZE]})
+                      for i in range(0, shade_idx.shape[0], CHUNK_SIZE)]
+        else:
+            chunks = [(slice(i, i+CHUNK_SIZE), {'chunk_idx': i})
+                      for i in range(0, base_color.shape[0], CHUNK_SIZE)]
         diffuse, specular, visibility, light_direct, light_indirect, direct_diffuse, direct_specular, indirect_diffuse, indirect_specular = [], [], [], [], [], [], [], [], []
-        for i in range(0, base_color.shape[0], CHUNK_SIZE):
-            render_results = rendering_equation(base_color[i:i+CHUNK_SIZE], roughness[i:i+CHUNK_SIZE], normal[i:i+CHUNK_SIZE], means3D[i:i+CHUNK_SIZE], -dir_pp_normalized[i:i+CHUNK_SIZE], pc, pipe=pipe, training=training, camera_center=viewpoint_camera.camera_center, chunk_idx=i)
+        for rows, row_kwargs in chunks:
+            render_results = rendering_equation(base_color[rows], roughness[rows], normal[rows], means3D[rows], -dir_pp_normalized[rows], pc, pipe=pipe, training=training, camera_center=viewpoint_camera.camera_center, **row_kwargs)
             diffuse.append(render_results['diffuse'])
             specular.append(render_results['specular'])
             visibility.append(render_results['visibility'])
@@ -409,15 +438,24 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
             direct_specular.append(render_results['direct_specular'])
             indirect_diffuse.append(render_results['indirect_diffuse'])
             indirect_specular.append(render_results['indirect_specular'])
-        diffuse = torch.cat(diffuse, 0)
-        specular = torch.cat(specular, 0)
-        visibility = torch.cat(visibility, 0)
-        light_direct = torch.cat(light_direct, 0)
-        light_indirect = torch.cat(light_indirect, 0)
-        direct_diffuse = torch.cat(direct_diffuse, 0)
-        direct_specular = torch.cat(direct_specular, 0)
-        indirect_diffuse = torch.cat(indirect_diffuse, 0)
-        indirect_specular = torch.cat(indirect_specular, 0)
+        def _cat_full(parts, channels):
+            # concatenate chunk outputs; under shade_idx scatter them back to [N, C]
+            x = torch.cat(parts, 0) if len(parts) > 0 else torch.zeros(0, channels, device=base_color.device)
+            if shade_idx is None:
+                return x
+            full = torch.zeros(base_color.shape[0], x.shape[-1] if x.numel() > 0 else channels, device=base_color.device, dtype=x.dtype if x.numel() > 0 else base_color.dtype)
+            if x.shape[0] > 0:
+                full[shade_idx] = x
+            return full
+        diffuse = _cat_full(diffuse, 3)
+        specular = _cat_full(specular, 3)
+        visibility = _cat_full(visibility, 1)
+        light_direct = _cat_full(light_direct, 3)
+        light_indirect = _cat_full(light_indirect, 3)
+        direct_diffuse = _cat_full(direct_diffuse, 3)
+        direct_specular = _cat_full(direct_specular, 3)
+        indirect_diffuse = _cat_full(indirect_diffuse, 3)
+        indirect_specular = _cat_full(indirect_specular, 3)
         direct = direct_diffuse + direct_specular
         indirect = indirect_diffuse + indirect_specular
         torch.cuda.empty_cache()
@@ -553,17 +591,43 @@ def sample_incident_rays(normals, is_training=False, sample_num=24):
 def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, pipe, training=False, f0=0.04, relight=False, camera_center=None, **kwargs):
     B = base_color.shape[0]
     envmap = pc.get_envmap
-    
+
     chunk_idx = kwargs.get('chunk_idx', None)
-    incident_dirs = pc.get_incident_directions.clone()
-    incident_areas = pc.get_incident_areas.clone()
-    incident_visibility = pc.get_incident_visibility.clone()
-    local_incident_lights = pc.get_local_incident_radiance.clone()
-    if chunk_idx is not None:
-        incident_dirs = incident_dirs[chunk_idx:chunk_idx+CHUNK_SIZE]
-        incident_areas = incident_areas[chunk_idx:chunk_idx+CHUNK_SIZE]
-        incident_visibility = incident_visibility[chunk_idx:chunk_idx+CHUNK_SIZE]
-        local_incident_lights = local_incident_lights[chunk_idx:chunk_idx+CHUNK_SIZE]
+    row_idx = kwargs.get('row_idx', None)  # P3 visible-set shading: explicit per-surfel indices
+
+    def _rows(t):
+        # Row selection on per-surfel cache tensors: explicit indices (visible-set shading)
+        # take precedence over the legacy contiguous chunk window.
+        if row_idx is not None:
+            return t[row_idx]
+        if chunk_idx is not None:
+            return t[chunk_idx:chunk_idx+CHUNK_SIZE]
+        return t
+
+    # P3 cache_view_independent (relight eval): everything except the GGX f_s is view-independent
+    # and precomputed per envmap by build_eval_shading_cache; per frame only the specular means
+    # are evaluated against the cached transports. Never used in training or the relight branch.
+    cache = getattr(pc, '_eval_shading_cache', None)
+    if cache is not None and getattr(pipe, 'cache_view_independent', False) and not training and not relight:
+        incident_dirs = _rows(pc.get_incident_directions)
+        f_s, ndf = GGX_specular(normals, viewdirs, incident_dirs, roughness, fresnel=f0)
+        return {
+            "diffuse": _rows(cache['diffuse']),
+            "specular": (f_s * _rows(cache['transport'])).mean(dim=-2),
+            "visibility": _rows(cache['visibility']),
+            "light": _rows(cache['light']),
+            "light_indirect": _rows(cache['light_indirect']),
+            "light_direct": _rows(cache['light_direct']),
+            "direct_diffuse": _rows(cache['direct_diffuse']),
+            "direct_specular": (f_s * _rows(cache['direct_transport'])).mean(dim=-2),
+            "indirect_diffuse": _rows(cache['indirect_diffuse']),
+            "indirect_specular": (f_s * _rows(cache['indirect_transport'])).mean(dim=-2),
+        }
+
+    incident_dirs = _rows(pc.get_incident_directions.clone())
+    incident_areas = _rows(pc.get_incident_areas.clone())
+    incident_visibility = _rows(pc.get_incident_visibility.clone())
+    local_incident_lights = _rows(pc.get_local_incident_radiance.clone())
     global_incident_lights = envmap(incident_dirs, mode='pure_env')
 
     # first_hit_pbr: swap in the pre-gathered first-hit L_ind (see precompute_first_hit_pbr).
@@ -571,9 +635,7 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
     # incident_visibility already holds 1 - full-composite alpha, so the vis*env split is intact.
     first_hit_pbr_on = getattr(pipe, 'first_hit_pbr', False) and getattr(pc, '_first_hit_pbr_ind', None) is not None
     if first_hit_pbr_on:
-        local_incident_lights = pc._first_hit_pbr_ind.clone()
-        if chunk_idx is not None:
-            local_incident_lights = local_incident_lights[chunk_idx:chunk_idx+CHUNK_SIZE]
+        local_incident_lights = _rows(pc._first_hit_pbr_ind.clone())
 
     if relight and not first_hit_pbr_on:
         features = torch.cat([pc.get_base_color, pc.get_rough], dim=1)
@@ -617,9 +679,7 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
     # radiosity: replace the one-bounce diffuse INDIRECT with the multi-bounce solved indirect.
     # Direct diffuse and the entire specular path (incl. one-bounce specular indirect) are kept.
     if getattr(pipe, 'use_radiosity_solve', False) and getattr(pc, '_radiosity_indirect', None) is not None:
-        rad_ind = pc._radiosity_indirect
-        if chunk_idx is not None:
-            rad_ind = rad_ind[chunk_idx:chunk_idx + CHUNK_SIZE]
+        rad_ind = _rows(pc._radiosity_indirect)
         indirect_diffuse = rad_ind
         diffuse = direct_diffuse + rad_ind
 
@@ -644,6 +704,60 @@ def rendering_equation(base_color, roughness, normals, position, viewdirs, pc, p
         }
     
     return results
+
+@torch.no_grad()
+def build_eval_shading_cache(pc, pipe, base_color=None, chunk=100000):
+    """P3 (single-layer surfel project): precompute, once per envmap, every view-independent
+    piece of rendering_equation's eval path — the incident-light assembly, the three transports,
+    the diffuse terms, and the visibility/light means. Per frame only GGX f_s changes, so the
+    per-frame cost drops from O(N*S) env-lookups + transport math to the specular means alone.
+
+    Mirrors the eval (non-relight) branch of rendering_equation EXACTLY, including the
+    first_hit_pbr L_ind swap, pipe.wo_indirect, and the radiosity-solve indirect replacement —
+    keep the two in sync. base_color must arrive pre-scaled (the caller applies
+    base_color_scale, matching render_radiogs). Eval-only; stored detached on
+    pc._eval_shading_cache; set pc._eval_shading_cache = None to invalidate."""
+    if base_color is None:
+        base_color = pc.get_base_color
+    dirs = pc.get_incident_directions               # [N,S,3]
+    areas = pc.get_incident_areas                   # [N,S,1]
+    vis = pc.get_incident_visibility                # [N,S,1]
+    local = pc.get_local_incident_radiance          # [N,S,3]
+    if getattr(pipe, 'first_hit_pbr', False) and getattr(pc, '_first_hit_pbr_ind', None) is not None:
+        local = pc._first_hit_pbr_ind
+    if pipe.wo_indirect:
+        local = torch.zeros_like(local)
+    # get_normal ignores dir_pp (camera flip is commented out), so normals — and with them
+    # n_d_i and every transport — are view-independent.
+    normals = pc.get_normal(scaling_modifier=1.0, dir_pp_normalized=None)
+    N = dirs.shape[0]
+    out = {k: [] for k in ['transport', 'direct_transport', 'indirect_transport', 'diffuse',
+                           'direct_diffuse', 'indirect_diffuse', 'visibility', 'light',
+                           'light_indirect', 'light_direct']}
+    for lo in range(0, N, chunk):
+        hi = min(lo + chunk, N)
+        n_d_i = (normals[lo:hi, None] * dirs[lo:hi]).sum(-1, keepdim=True).clamp(min=0)
+        glob = pc.get_envmap(dirs[lo:hi], mode='pure_env')
+        inc = vis[lo:hi] * glob + local[lo:hi]
+        w = areas[lo:hi] * n_d_i
+        f_d = base_color[lo:hi, None] / np.pi
+        out['transport'].append(inc * w)
+        out['direct_transport'].append(vis[lo:hi] * glob * w)
+        out['indirect_transport'].append(local[lo:hi] * w)
+        out['diffuse'].append((f_d * (inc * w)).mean(dim=-2))
+        out['direct_diffuse'].append((f_d * (vis[lo:hi] * glob * w)).mean(dim=-2))
+        out['indirect_diffuse'].append((f_d * (local[lo:hi] * w)).mean(dim=-2))
+        out['visibility'].append(vis[lo:hi].mean(dim=1))
+        out['light'].append(inc.mean(dim=1))
+        out['light_indirect'].append(local[lo:hi].mean(dim=1))
+        out['light_direct'].append(glob.mean(dim=1))
+    cache = {k: torch.cat(v, dim=0) for k, v in out.items()}
+    if getattr(pipe, 'use_radiosity_solve', False) and getattr(pc, '_radiosity_indirect', None) is not None:
+        cache['indirect_diffuse'] = pc._radiosity_indirect.detach()
+        cache['diffuse'] = cache['direct_diffuse'] + cache['indirect_diffuse']
+    pc._eval_shading_cache = cache
+    return cache
+
 
 def rendering_equation_radiosity(base_color, roughness, normals, position, viewdirs, pc, pipe, f0=0.04, camera_center=None, precompute=False, return_hit_idx=False, **kwargs):
     if not precompute:
