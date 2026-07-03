@@ -26,6 +26,8 @@ extern "C" __global__ void __raygen__rg() {
 
 	// radiosity: gs_idx of the first accepted surfel along this ray (-1 if the ray hits nothing).
 	int hit0 = -1;
+	// virtual-surfel: count of prefix entries written so far for this ray (capped at params.n_prefix).
+	int nprefix = 0;
 
 	HitInfo hitArray[MAX_BUFFER_SIZE];
 	unsigned int hitArrayPtr0 = (unsigned int)((uintptr_t)(&hitArray) & 0xFFFFFFFF);
@@ -110,6 +112,16 @@ extern "C" __global__ void __raygen__rg() {
 				D += w * d;
 				O += w;
 				M2 += w * w;  // single-layer: accumulate Sum w_i^2 for the k_eff surrogate
+
+				// virtual-surfel: record this accepted surfel (gs_idx, w=T*alpha) into the ray's
+				// significant-hit prefix. w uses the pre-update T, so entries are the true composite
+				// weights and prefix[0] == hit0 (the first-accepted surfel). Capped at n_prefix; the
+				// truncated tail carries < transmittance_min residual by construction.
+				if (params.prefix_idx != nullptr && nprefix < params.n_prefix){
+					params.prefix_idx[idx.x * params.n_prefix + nprefix] = gs_idx;
+					params.prefix_w[idx.x * params.n_prefix + nprefix] = w;
+					nprefix += 1;
+				}
 
 				for (int j = 0; j < params.S; ++j){
 					F[j] += w * params.features[gs_idx * params.S + j];

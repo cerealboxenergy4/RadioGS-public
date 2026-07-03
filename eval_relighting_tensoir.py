@@ -48,7 +48,12 @@ if __name__ == '__main__':
     parser.add_argument("--finetune", default=False, action='store_true')
     parser.add_argument("--envmaps", default=[], nargs='+', type=str, help="If provided, only use the specified envmaps for relighting (without path and extension)")
     parser.add_argument("--start", default=0, type=int)
+    parser.add_argument("--seed", default=-1, type=int, help="If >=0, seed torch/np so the (unseeded-by-default) "
+                        "light-importance sampling is reproducible across processes — needed to compare eval runs "
+                        "at sub-0.03 dB (e.g. fhpbr hit-mode A/B) without the cross-process multinomial noise floor.")
     args = get_combined_args(parser)
+    if getattr(args, 'seed', -1) is not None and args.seed >= 0:
+        torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed); np.random.seed(args.seed)
     dataset = model.extract(args)
     pipe = pipeline.extract(args)
 
@@ -221,7 +226,10 @@ if __name__ == '__main__':
                     if getattr(pipe, 'first_hit_pbr', False):
                         gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min,
                                                            back_culling=pipe.back_culling,
-                                                           base_color_scale=base_color_scale)
+                                                           base_color_scale=base_color_scale,
+                                                           hit_mode=getattr(pipe, 'fhpbr_hit_mode', 'first_accepted'),
+                                                           n_prefix=getattr(pipe, 'fhpbr_prefix_k', 8),
+                                                           toksvig=getattr(pipe, 'fhpbr_virtual_toksvig', 1.0))
                     # P3 cache_view_independent: bake every view-independent shading term for
                     # THIS envmap (must run after the incident/fhpbr/radiosity precomputes above,
                     # whose outputs it consumes); per frame only GGX specular is evaluated.

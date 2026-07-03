@@ -157,6 +157,17 @@ class PipelineParams(ParamGroup):
         # and more so on multi-layer geometry (-0.55 stock / -0.15 ironed). Prefer composite
         # training + eval-time swap. See GaussianModel.precompute_first_hit_pbr. Default off.
         self.first_hit_pbr = False
+        # fhpbr occluder estimator (eval-time; see GaussianModel.precompute_first_hit_pbr):
+        #   'first_accepted'  - gather at the ray's first-accepted surfel (original fhpbr; default).
+        #   'argmax'          - gather at the dominant (max composite-weight) surfel of the
+        #                       significant-hit prefix ("first significant hit" for fhpbr).
+        #   'virtual'         - one gather at a prefiltered virtual surfel (weighted-mean albedo/
+        #                       normal, Toksvig-widened roughness); collapses the prefix to 1 eval.
+        #   'prefix_composite'- transmittance-weighted composite of per-surfel PBR over the prefix
+        #                       (reference; K evals/ray). On single-layer geometry all four agree.
+        self.fhpbr_hit_mode = "first_accepted"
+        self.fhpbr_prefix_k = 8            # prefix capacity K for the non-'first_accepted' modes
+        self.fhpbr_virtual_toksvig = 1.0   # normal-variance -> roughness widening strength (virtual mode)
         # Per-iteration refresh of the fhpbr indirect buffer for the radiosity-sampled subset,
         # reusing the subset's live trace hit indices (no extra rays). Closes the freshness gap
         # vs the composited cache, which already gets the per-iteration subset update. Requires

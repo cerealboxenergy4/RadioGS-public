@@ -24,6 +24,9 @@ struct Gaussiantrace_forward {
 		float* alpha;
 		float* alpha_m2;                  // single-layer: per-ray second moment Sum_i w_i^2 (k_eff surrogate)
 		int* hit_idx;                     // radiosity: per-ray first-accepted surfel gs_idx (-1 if none), nullable
+		int* prefix_idx;                  // virtual-surfel: first n_prefix accepted gs_idx per ray (row-major [ray,K], -1 fill), nullable
+		float* prefix_w;                  // virtual-surfel: matching composite weights w=T*alpha at acceptance, nullable
+		int n_prefix;                     // virtual-surfel: prefix capacity K (0 = disabled)
 		float alpha_min;
 		float transmittance_min;
 		int deg;

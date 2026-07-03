@@ -42,9 +42,9 @@ public:
     void trace_forward(
         const torch::Tensor rays_o, const torch::Tensor rays_d, const torch::Tensor gs_idxs, 
         const torch::Tensor means3D, const torch::Tensor opacity, const torch::Tensor ru, const torch::Tensor rv, const torch::Tensor normals, const torch::Tensor features, const torch::Tensor shs, 
-        torch::Tensor color, torch::Tensor normal, torch::Tensor feature, torch::Tensor depth, torch::Tensor alpha, torch::Tensor alpha_m2, torch::Tensor hit_idx,
+        torch::Tensor color, torch::Tensor normal, torch::Tensor feature, torch::Tensor depth, torch::Tensor alpha, torch::Tensor alpha_m2, torch::Tensor hit_idx, torch::Tensor prefix_idx, torch::Tensor prefix_w,
         const float alpha_min, const float transmittance_min, const int deg, const bool back_culling, const float super_gaussian_order,
-        const bool first_hit_only, torch::Tensor counters
+        const bool first_hit_only, torch::Tensor counters, const int n_prefix
         ){
         const uint32_t n_elements = rays_o.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -56,12 +56,15 @@ public:
         unsigned long long* counters_ptr = (counters.numel() > 0) ? (unsigned long long*)counters.data_ptr<int64_t>() : nullptr;
         // radiosity: pass the first-hit index buffer only when requested (numel>0), else nullptr.
         int* hit_idx_ptr = (hit_idx.numel() > 0) ? hit_idx.data_ptr<int>() : nullptr;
+        // virtual-surfel: pass the significant-hit prefix buffers only when requested (numel>0), else nullptr.
+        int* prefix_idx_ptr = (prefix_idx.numel() > 0) ? prefix_idx.data_ptr<int>() : nullptr;
+        float* prefix_w_ptr = (prefix_w.numel() > 0) ? prefix_w.data_ptr<float>() : nullptr;
 
         triangle_bvh->gaussian_trace_forward(
             n_elements, S, (const glm::vec3*)rays_o.data_ptr<float>(), (const glm::vec3*)rays_d.data_ptr<float>(), gs_idxs.data_ptr<int>(),
             (const glm::vec3*)means3D.data_ptr<float>(), opacity.data_ptr<float>(), (const glm::vec3*)ru.data_ptr<float>(), (const glm::vec3*)rv.data_ptr<float>(), (const glm::vec3*)normals.data_ptr<float>(), features.data_ptr<float>(), (const glm::vec3*)shs.data_ptr<float>(),
-            (glm::vec3*)color.data_ptr<float>(), (glm::vec3*)normal.data_ptr<float>(), feature.data_ptr<float>(), depth.data_ptr<float>(), alpha.data_ptr<float>(), alpha_m2.data_ptr<float>(), hit_idx_ptr,
-            alpha_min, transmittance_min, deg, max_coeffs, back_culling, super_gaussian_order, first_hit_only, counters_ptr, stream);
+            (glm::vec3*)color.data_ptr<float>(), (glm::vec3*)normal.data_ptr<float>(), feature.data_ptr<float>(), depth.data_ptr<float>(), alpha.data_ptr<float>(), alpha_m2.data_ptr<float>(), hit_idx_ptr, prefix_idx_ptr, prefix_w_ptr,
+            alpha_min, transmittance_min, deg, max_coeffs, back_culling, super_gaussian_order, first_hit_only, counters_ptr, n_prefix, stream);
     }
     
     void intersection_test(
