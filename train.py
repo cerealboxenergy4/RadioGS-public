@@ -34,6 +34,19 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+@torch.no_grad()
+def resample_all_incident_dirs(gaussians, pipe):
+    """transport_graph increment 1: resample ALL N incident direction sets (random-rotated
+    fibonacci) into the cache at refresh time. Same convention as the initial seed below:
+    get_normal ignores its dir_pp arg (the camera flip is commented out), so the canonical
+    splat normal is used and no camera is needed — do not re-add a camera flip here, or the
+    cached dirs would decorrelate from the n_d_i clamp at render time."""
+    normal = gaussians.get_normal(scaling_modifier=1.0, dir_pp_normalized=None)
+    dirs, areas = sample_incident_rays(normal, is_training=pipe.radiosity_random_sample,
+                                       sample_num=pipe.diffuse_sample_num)
+    gaussians.update_incidents_directions(dirs, areas)
+
+
 def sample_keff_rays(gaussians, n_surfels, n_dirs, offset_scale):
     """Sample secondary/GI-style rays for the k_eff loss: origins at a random subset of surfels
     (offset along the normal to avoid self-hit), directions over the hemisphere about each normal.
@@ -72,6 +85,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
     gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
     set_gaussian_para(gaussians, opt)
+
+    # ---- transport_graph startup guards (see arguments/__init__.py for flag semantics) ----
+    tg = getattr(pipe, 'transport_graph', False)
+    tg_rot = tg or getattr(pipe, 'transport_graph_rotate_all', False)
+    tg_gather = tg and getattr(pipe, 'transport_graph_diff_gather', False)
+    if tg_rot:
+        assert pipe.radiosity_sample_num == pipe.diffuse_sample_num, \
+            "transport_graph: cache rows are [N, diffuse_sample_num]; the subset loss consumes radiosity_sample_num"
+    if tg:
+        assert not pipe.use_rad_imp, "transport_graph: the use_rad_imp precompute sub-path traces spec rays"
+        assert not getattr(pipe, 'fhpbr_subset_refresh', False) and getattr(opt, 'lambda_fhpbr_j', 0.0) == 0.0, \
+            "transport_graph drops the live subset trace these consume"
+        assert not getattr(pipe, 'use_radiosity_solve', False), \
+            "transport_graph v1: radiosity T would go stale under per-refresh direction resampling"
+        if getattr(pipe, 'first_hit_pbr', False):
+            print("[transport_graph] warning: first_hit_pbr TRAINING composes but is measured net-negative; "
+                  "the tg loss RHS uses composite cache rows while shading uses fhpbr rows")
+    if tg_gather:
+        assert not pipe.detach_rad_indirect, \
+            "transport_graph_diff_gather: detach_rad_indirect would silently detach the gathered lights"
+        assert pipe.radiosity_gaussian_num > 0, \
+            "transport_graph_diff_gather: full-N subset (-1) would build a prohibitive gather graph"
     
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -97,6 +132,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
+    refresh_start = torch.cuda.Event(enable_timing=True)  # brackets the indirect-refresh block
+    refresh_end = torch.cuda.Event(enable_timing=True)
     total_training_time = 0.0
     
     viewpoint_stack = None
@@ -111,6 +148,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iteration = first_iter
 
     # update incident visibility per Gaussian
+    # transport_graph: seed with only_vis=False — under tg the consistency-loss RHS comes ONLY
+    # from the cache, so iters 1..(interval-1) need real indirect radiance (SH is loaded from the
+    # stage-1 checkpoint, so it is well-defined at iter 0); stock keeps the radiance zeroed until
+    # the first refresh and gets its indirect from the live subset trace instead.
     viewpoint_dummy = scene.getTrainCameras().copy()
     cam = viewpoint_dummy.pop(randint(0, len(viewpoint_dummy) - 1))
     with torch.no_grad():
@@ -119,7 +160,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_dummy = gaussians.get_normal(scaling_modifier=1.0, dir_pp_normalized=dir_pp_normalized)
         incident_directions, incident_areas = sample_incident_rays(normal_dummy, is_training=pipe.radiosity_random_sample, sample_num=pipe.diffuse_sample_num)
         gaussians.update_incidents_directions(incident_directions, incident_areas)
-        gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=True, back_culling=pipe.back_culling, return_hit_idx=getattr(pipe, 'first_hit_pbr', False))
+        gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=not tg, back_culling=pipe.back_culling, return_hit_idx=getattr(pipe, 'first_hit_pbr', False) or tg)
 
     # radiosity: build the static transport matrix T once. Geometry is frozen in stage 2
     # (lr_scale=0 => geometry LRs are 0, and the BVH is only updated when lr_scale>0), so T is
@@ -137,9 +178,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     while iteration < opt.iterations + 1:
         iter_start.record()
 
-        if iteration % opt.indirect_update_interval == 0:
+        is_refresh = iteration % opt.indirect_update_interval == 0
+        if is_refresh:
+            refresh_start.record()
             with torch.no_grad():
-                gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, back_culling=pipe.back_culling, return_hit_idx=getattr(pipe, 'first_hit_pbr', False))
+                # transport_graph increment 1: fresh random-rotated direction sets for ALL N at
+                # every refresh (stock only ever rotates the per-iteration subset's rows).
+                if tg_rot:
+                    resample_all_incident_dirs(gaussians, pipe)
+                gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, back_culling=pipe.back_culling, return_hit_idx=getattr(pipe, 'first_hit_pbr', False) or tg)
             if getattr(pipe, 'use_radiosity_solve', False) and pipe.radiosity_rebuild_interval > 0 \
                     and iteration % pipe.radiosity_rebuild_interval == 0:
                 gaussians.build_radiosity_transport(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
@@ -147,6 +194,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # (each refresh deepens the effective bounce depth by one).
             if getattr(pipe, 'first_hit_pbr', False):
                 gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
+            refresh_end.record()
 
         # radiosity: multi-bounce diffuse solve feeding rendering_equation's indirect_diffuse.
         # differentiable => re-solve every iter (fresh graph for backward); else detached refresh.
@@ -218,6 +266,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             torch.cuda.synchronize()
             iteration_time = iter_start.elapsed_time(iter_end) / 1000.0  # ms to seconds
             total_training_time += iteration_time
+
+            # cost instrumentation (transport_graph A/B): per-iteration wall time, amortized
+            # refresh time, and analytic secondary-ray counts (no kernel-side counters).
+            tb_dict["time_iter_ms"] = iteration_time * 1000.0
+            if is_refresh:
+                tb_dict["time_refresh_ms"] = refresh_start.elapsed_time(refresh_end)
+                tb_dict["rays_refresh"] = gaussians.get_xyz.shape[0] * pipe.diffuse_sample_num
+            if pipe.use_radiosity:
+                n_sub = pipe.radiosity_gaussian_num if pipe.radiosity_gaussian_num > 0 else gaussians.get_xyz.shape[0]
+                tb_dict["rays_live_trace"] = 0 if tg else n_sub * pipe.radiosity_sample_num
 
             if iteration % 500 == 0 or iteration == first_iter + 1:
                 save_training_vis(viewpoint_cam, gaussians, background, render, pipe, opt, iteration)

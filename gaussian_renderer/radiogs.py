@@ -272,23 +272,58 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
         rad_shs = pc.get_features
         rad_shs = rad_shs[sample_mask].transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
 
-        # fhpbr: hit indices from the subset's live trace are needed by the j-consistency loss
-        # and/or the per-iteration fhpbr buffer refresh (both default-off).
-        fhpbr_need_hits = (getattr(opt, 'lambda_fhpbr_j', 0.0) > 0) or \
-            (getattr(pipe, 'fhpbr_subset_refresh', False) and getattr(pipe, 'first_hit_pbr', False)
-             and getattr(pc, '_first_hit_pbr_ind', None) is not None)
-        radiosity_result = rendering_equation_radiosity(
-                            rad_base_color,
-                            rad_roughness,
-                            rad_normals,
-                            rad_points,
-                            rad_view,
-                            pc, pipe=pipe,
-                            camera_center=viewpoint_camera.camera_center,
-                            training=training,
-                            return_hit_idx=fhpbr_need_hits)
+        # transport_graph (increments 2+3): feed the consistency loss from the CACHED rows —
+        # zero rays traced this iteration. Rows are refreshed (with rotated directions) every
+        # indirect_update_interval by train.py, the same staleness contract as the full-N
+        # shading cache. Receiver-side BRDF/SH/env gradient paths are identical to the live
+        # path (the precompute branch shares that code); what the live trace additionally
+        # provided — occluder-SH gradients through the composited trace color — is restored in
+        # one-hop form by transport_graph_diff_gather: L_ind := (1 - vis) * SH(hit_idx, dir),
+        # attributing the whole ray to its first hit (the single-layer premise).
+        tg = getattr(pipe, 'transport_graph', False)
+        if tg:
+            cd = pc.get_incident_directions[sample_mask]      # [M,S,3]
+            ca = pc.get_incident_areas[sample_mask]           # [M,S,1]
+            cv = pc.get_incident_visibility[sample_mask]      # [M,S,1] detached buffer
+            cl = pc.get_local_incident_radiance[sample_mask]  # [M,S,3] detached buffer
+            if getattr(pipe, 'transport_graph_diff_gather', False) and pc._incident_hit_idx is not None:
+                hit = pc._incident_hit_idx[sample_mask].long()               # [M,S], -1 = miss
+                shs_hit = pc.get_features[hit.clamp(min=0)].transpose(-1, -2)  # [M,S,3,C]
+                sh_rgb = torch.clamp_min(eval_sh(pc.active_sh_degree, shs_hit, cd) + 0.5, 0.0)
+                # (hit >= 0) mask required: clamp(min=0) would leak gradient to surfel 0 on misses
+                cl = (1.0 - cv) * sh_rgb * (hit >= 0).unsqueeze(-1)
+            radiosity_result = rendering_equation_radiosity(
+                                rad_base_color,
+                                rad_roughness,
+                                rad_normals,
+                                rad_points,
+                                rad_view,
+                                pc, pipe=pipe,
+                                precompute=True,
+                                incident_dirs=cd,
+                                incident_areas=ca,
+                                incident_visibility=cv,
+                                local_incident_lights=cl,
+                                camera_center=viewpoint_camera.camera_center)
+        else:
+            # fhpbr: hit indices from the subset's live trace are needed by the j-consistency loss
+            # and/or the per-iteration fhpbr buffer refresh (both default-off).
+            fhpbr_need_hits = (getattr(opt, 'lambda_fhpbr_j', 0.0) > 0) or \
+                (getattr(pipe, 'fhpbr_subset_refresh', False) and getattr(pipe, 'first_hit_pbr', False)
+                 and getattr(pc, '_first_hit_pbr_ind', None) is not None)
+            radiosity_result = rendering_equation_radiosity(
+                                rad_base_color,
+                                rad_roughness,
+                                rad_normals,
+                                rad_points,
+                                rad_view,
+                                pc, pipe=pipe,
+                                camera_center=viewpoint_camera.camera_center,
+                                training=training,
+                                return_hit_idx=fhpbr_need_hits)
 
-        if opt.rad_update_indirect:
+        # transport_graph: no per-iteration row writes — all rows refresh at rebuild cadence
+        if opt.rad_update_indirect and not tg:
             diffuse_incident_dirs = radiosity_result['incident_dirs'][:, :pipe.radiosity_sample_num]
             diffuse_incident_areas = torch.ones_like(diffuse_incident_dirs)[..., 0:1] * 2 * np.pi
             diffuse_visibility = radiosity_result['incident_visibility'][:, :pipe.radiosity_sample_num]
