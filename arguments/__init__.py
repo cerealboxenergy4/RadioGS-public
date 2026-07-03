@@ -263,6 +263,13 @@ class OptimizationParams(ParamGroup):
         self.keff_n_dirs = 8                # hemisphere directions sampled per surfel
         self.keff_offset_scale = 3.0        # origin offset = scale * mean surfel scale, along +normal
 
+        # ---- stage-2 alpha-binary loss (opacity binarization on the same k_eff ray batch) ----
+        # Penalize a*(1-a) on hit rays, pushing per-ray composite alpha -> 1. Rationale: k_eff -> 1
+        # alone is not single-layer; under first_hit_only the ray's alpha collapses to the first
+        # surfel's alpha, so alpha < 1 leaks env light through occluded rays (measured -1.3..-2.4 dB
+        # relight on ironed geometry). Shares the keff_* schedule/batch knobs above. 0 == off.
+        self.lambda_alpha_binary = 0.0
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

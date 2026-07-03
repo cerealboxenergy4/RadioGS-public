@@ -60,6 +60,20 @@ def keff_loss(trace_alpha, trace_alpha_m2, alpha_threshold=0.5, eps=1e-8):
         return (values - 1.0).clamp_min(0.0).mean(), values.detach().mean(), foreground.float().mean()
     zero = trace_alpha.sum() * 0.0
     return zero, zero.detach(), zero.detach()
+
+
+def alpha_binary_loss(trace_alpha, alpha_threshold=0.5):
+    """Opacity binarization on traced secondary rays: penalize a*(1-a) on rays that hit geometry
+    (trace_alpha > threshold), pushing each hit ray's composite alpha toward 1. k_eff -> 1 alone is
+    not single-layer: under first_hit_only the ray's alpha collapses to its first surfel's alpha, so
+    any alpha < 1 leaks environment light through occluded rays and under-scales L_ind. Companion to
+    keff_loss on the same ray batch (k_eff -> 1 AND alpha -> 1 makes first-hit tracing near-exact)."""
+    foreground = trace_alpha > alpha_threshold
+    if foreground.any():
+        a = trace_alpha[foreground]
+        return (a * (1.0 - a)).mean(), a.detach().mean(), foreground.float().mean()
+    zero = trace_alpha.sum() * 0.0
+    return zero, zero.detach(), zero.detach()
 from utils.graphics_utils import rgb_to_srgb, srgb_to_rgb
 
 def cos_loss(output, gt, thrsh=0, weight=1):
