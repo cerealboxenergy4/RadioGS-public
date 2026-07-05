@@ -77,6 +77,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     psnr_test = 0
 
     progress_bar = tqdm(range(first_iter, TOT_ITER), desc="Training progress")
+    # single-layer: last mask0 reset seen (gates the early contrib prune; on resume, treating
+    # the resume point as a reset just delays the first prune by the margin)
+    last_reset0_iter = first_iter
     first_iter += 1
     iteration = first_iter
 
@@ -155,15 +158,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # ---- single-layer ironing loss (N_eff) ----
         neff_for_log = 0.0
+        neff_contrib = None
         if 'rend_alpha_m2' in render_pkg:
             single_w = scheduled_weight(opt.lambda_single, iteration, opt.single_warmup_iters,
                                         opt.single_ramp_iters, opt.single_until_iter, opt.single_decay_iters)
             if single_w > 0.0:
                 single_raw, neff_for_log, _ = single_layer_loss(
                     render_pkg['rend_alpha'], render_pkg['rend_alpha_m2'], opt.single_alpha_thresh)
-                total_loss = total_loss + single_w * single_raw
+                neff_contrib = single_w * single_raw
 
-        total_loss.backward()
+        # (G) decoupled backward: keep the N_eff gradient OUT of the densification accumulator.
+        # Only worth splitting the backward while densification is still live (else the clean grad
+        # is unused); outside that window fold N_eff back in for a single backward as before.
+        clean_vs_grad = None
+        if (opt.decouple_single_grad and neff_contrib is not None
+                and iteration < opt.densify_until_iter):
+            total_loss.backward(retain_graph=True)  # photometric/geometric only
+            if viewspace_point_tensor.grad is not None:
+                clean_vs_grad = viewspace_point_tensor.grad.detach().clone()
+            neff_contrib.backward()                 # add N_eff grad so the optimizer step is unchanged
+        else:
+            if neff_contrib is not None:
+                total_loss = total_loss + neff_contrib
+            total_loss.backward()
 
         iter_end.record()
         with torch.no_grad():
@@ -213,7 +230,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter and iteration != opt.volume_render_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
                                                                      radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, radiosity_tensor)
+                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, radiosity_tensor,
+                                                  clean_grad=clean_vs_grad)
 
                 if iteration <= opt.init_until_iter:
                     opacity_reset_intval = 3000
@@ -225,16 +243,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     opacity_reset_intval = 3000
                     densification_interval = 100
 
+                # single-layer: early transmittance-aware prune (reuses the vprune stats).
+                # Opacity pruning can't see an occluded high-alpha duplicate layer; its max
+                # blend weight can. Skips reset iterations (mask0/mask1 fire on
+                # normal_prop_interval multiples) and the post-mask0 window where every
+                # surfel's blend weight is collapsed to ~0.01 and can't discriminate.
+                if (opt.contrib_prune_interval > 0 and opt.visibility_prune_interval > 0
+                        and iteration > opt.densify_from_iter
+                        and iteration % opt.contrib_prune_interval == 0
+                        and iteration % opt.normal_prop_interval != 0
+                        and iteration - last_reset0_iter >= opt.contrib_prune_reset_margin):
+                    gaussians.visibility_prune(opt.contrib_prune_thresh, 1, opt.contrib_prune_max_fraction)
+
                 if iteration > opt.densify_from_iter and iteration % densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_opacity_threshold, scene.cameras_extent,
-                                                size_threshold)
+                                                size_threshold, alpha_preserving=opt.alpha_preserving_densify,
+                                                clone_as_split=opt.densify_clone_as_split)
 
                 HAS_RESET0 = False
                 if iteration % opacity_reset_intval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     HAS_RESET0 = True
+                    last_reset0_iter = iteration
                     outside_msk = get_outside_msk()
-                    gaussians.reset_opacity_mask0()
+                    dom_msk = (gaussians.get_dominant_mask(opt.dominance_reset_thresh)
+                               if opt.dominance_reset_thresh > 0 and iteration >= opt.dominance_reset_from_iter
+                               else None)
+                    if dom_msk is not None:
+                        print(f"\n[dom-reset0] iter {iteration}: keeping {int(dom_msk.sum())}/{dom_msk.shape[0]} dominant", flush=True)
+                    gaussians.reset_opacity_mask0(keep_msk=dom_msk)
+                    if opt.visibility_prune_interval > 0:
+                        gaussians.reset_contribution_stats()  # blend weights straddling a mask0 clamp are garbage
                     gaussians.reset_metallic_mask(exclusive_msk=outside_msk)
                     if opt.reset_sh_features:
                         gaussians.reset_features()
@@ -244,7 +283,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if (opt.init_until_iter < iteration <= opt.normal_prop_until_iter ) and iteration % opt.normal_prop_interval == 0:
                     if not HAS_RESET0:
                         outside_msk = get_outside_msk()
-                        gaussians.reset_opacity_mask1(exclusive_msk=outside_msk)
+                        dom_msk = (gaussians.get_dominant_mask(opt.dominance_reset_thresh)
+                                   if opt.dominance_reset_thresh > 0 and iteration >= opt.dominance_reset_from_iter
+                                   else None)
+                        if dom_msk is not None:
+                            print(f"\n[dom-reset1] iter {iteration}: re-inflating only {int(dom_msk.sum())}/{dom_msk.shape[0]} dominant", flush=True)
+                        gaussians.reset_opacity_mask1(exclusive_msk=outside_msk, dominant_msk=dom_msk)
                         if opt.reset_sh_features:
                             gaussians.reset_features()
                         if iteration > opt.volume_render_until_iter and opt.volume_render_until_iter > opt.init_until_iter:
