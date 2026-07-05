@@ -147,6 +147,37 @@ class OptimizationParams(ParamGroup):
         self.visibility_prune_thresh = 0.05
         self.visibility_prune_max_fraction = 0.0
 
+        # ---- single-layer densify/prune machinery adaptations ----
+        # (1) alpha-preserving clone/split: overlapping children get 1-(1-a)^(1/N) so the
+        #     composited alpha (and per-pixel N_eff) is preserved through densification
+        #     instead of ~doubling in the footprint at every clone/split.
+        self.alpha_preserving_densify = False
+        # (3) early transmittance-aware prune during densification (reuses the vprune
+        #     max-blend-weight stats): opacity pruning can't see an occluded high-alpha
+        #     duplicate layer; its max blend weight can. Fires on its own cadence, skipping
+        #     reset iterations and the post-mask0 window where all weights collapse to ~0.01.
+        self.contrib_prune_interval = 0        # 0 = off
+        self.contrib_prune_thresh = 0.01
+        self.contrib_prune_max_fraction = 0.1  # per-call prune cap
+        self.contrib_prune_reset_margin = 1500 # min iters past the last mask0 reset
+        # (4) dominance-preserving opacity resets: mask0 keeps ray-dominant surfels at their
+        #     current opacity (only non-dominant layers are re-opened for competition);
+        #     mask1 stops re-inflating non-dominant layers to 0.9.
+        self.dominance_reset_thresh = 0.0      # 0 = off; else min max-blend-weight to count as dominant
+        self.dominance_reset_from_iter = 15_000  # engage with the ironing phase (= single_warmup_iters)
+        # (G) decouple the N_eff loss gradient from the densification accumulator. The N_eff loss
+        #     puts large gradients on redundant stacked surfels; the densifier reads those as
+        #     "high positional gradient -> clone/split" and amplifies exactly what the loss is
+        #     collapsing. Two-backward split (base retain_graph -> stash clean viewspace grad ->
+        #     N_eff backward for the step) so densify sees only photometric/geometric gradient.
+        self.decouple_single_grad = False
+        # (S) route clone candidates (small, high-grad surfels) through SPLIT instead of clone.
+        #     Clone duplicates in place -> a coincident 2nd layer along the ray (N_eff spike the
+        #     loss must then undo); split displaces children within the tangent plane (in-surface
+        #     refinement, no stacking). Trades clone's size-preserving coverage growth for
+        #     single-layer-friendly lateral subdivision (may over-fragment / under-cover detail).
+        self.densify_clone_as_split = False
+
         self.lambda_base_color_smooth = 0.0
         self.lambda_roughness_smooth = 0.0
         self.lambda_metallic_smooth = 0.0

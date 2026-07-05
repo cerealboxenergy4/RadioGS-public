@@ -402,17 +402,26 @@ class RefGaussianModel:
             save_path = path.replace('.ply', '_2.map')
             torch.save(self.env_map_2.state_dict(), save_path)
 
-    def reset_opacity_mask0(self):
+    def reset_opacity_mask0(self, keep_msk = None):
         opacities_new = self.inverse_opacity_activation(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
+        if keep_msk is not None:
+            # single-layer dominance-preserving reset: the ray-dominant layer keeps its
+            # opacity; only non-dominant (duplicate/fringe) layers are re-opened for
+            # competition and left to the post-reset opacity prune if nothing revives them.
+            opacities_new[keep_msk] = self._opacity[keep_msk]
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
-    def reset_opacity_mask1(self, exclusive_msk = None):
+    def reset_opacity_mask1(self, exclusive_msk = None, dominant_msk = None):
         RESET_V = 0.9
         opacity_old = self.get_opacity
         o_msk = (opacity_old > RESET_V).flatten()
         if exclusive_msk is not None:
             o_msk = torch.logical_or(o_msk, exclusive_msk)
+        if dominant_msk is not None:
+            # single-layer: don't re-inflate non-dominant layers to 0.9 — stock behavior
+            # revives exactly the duplicate layers the ironing loss ground down.
+            o_msk = torch.logical_or(o_msk, ~dominant_msk)
         opacities_new = torch.ones_like(opacity_old)*inverse_sigmoid(torch.tensor([RESET_V]).cuda())
         opacities_new[o_msk] = self._opacity[o_msk]
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
@@ -642,6 +651,12 @@ class RefGaussianModel:
         self.radiosity_accum = self.radiosity_accum[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        # single-layer: carry contribution stats through pruning so the dominance-preserving
+        # resets and the early contrib prune (which fire on densify iterations, after the
+        # point count already changed) still see aligned stats instead of a forced reset.
+        if getattr(self, "contribution_accum", torch.empty(0)).shape[0] == valid_points_mask.shape[0]:
+            self.contribution_accum = self.contribution_accum[valid_points_mask]
+            self.contribution_view_count = self.contribution_view_count[valid_points_mask]
 
     # ---- single-layer visibility prune (ported from single-layer-surfel Part 1) ----
     def reset_contribution_stats(self):
@@ -655,6 +670,14 @@ class RefGaussianModel:
         self.contribution_accum = torch.maximum(self.contribution_accum, surfel_contrib.detach())
         if visibility_filter is not None:
             self.contribution_view_count[visibility_filter] += 1
+
+    def get_dominant_mask(self, thresh):
+        """Surfels whose max blend weight since the last stats reset clears `thresh` (w > 0.5 on
+        some pixel implies argmax there). None if stats are missing or misaligned."""
+        accum = getattr(self, "contribution_accum", None)
+        if accum is None or accum.shape[0] != self.get_xyz.shape[0]:
+            return None
+        return accum >= thresh
 
     def visibility_prune(self, contribution_threshold, min_visible_views=1, max_prune_fraction=0.0):
         """Prune Gaussians whose max per-pixel contribution across all seen views stays below
@@ -734,14 +757,18 @@ class RefGaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, alpha_preserving=False,
+                          include_small=False):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        if not include_small:
+            # stock: split only over-reconstructed (large) surfels; small ones go to clone.
+            # (S) include_small=True splits the clone candidates too (single-layer lateral refine).
+            selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                                  torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
@@ -761,14 +788,29 @@ class RefGaussianModel:
         new_indirect_dc = self._indirect_dc[selected_pts_mask].repeat(N,1,1)
         new_indirect_rest = self._indirect_rest[selected_pts_mask].repeat(N,1,1)
         
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        if alpha_preserving:
+            # 1-(1-a)^(1/N) per child preserves the composited alpha of the N overlapping
+            # children in the parent footprint (stock repeat ~doubles it -> instant extra layer)
+            a = self.get_opacity[selected_pts_mask].clamp(1e-6, 1.0 - 1e-6)
+            new_opacity = self.inverse_opacity_activation(
+                (1.0 - torch.pow(1.0 - a, 1.0 / N)).clamp(1e-4, 1.0 - 1e-4)).repeat(N, 1)
+        else:
+            new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
         self.densification_postfix(new_xyz, new_metallic, new_roughness, new_base_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_rest, new_opacity, new_scaling, new_rotation)
+
+        # single-layer: children inherit the parent's contribution stats (extend BEFORE the
+        # parent prune below so prune_points slices an aligned array)
+        if getattr(self, "contribution_accum", torch.empty(0)).shape[0] == n_init_points:
+            self.contribution_accum = torch.cat(
+                [self.contribution_accum, self.contribution_accum[selected_pts_mask].repeat(N)])
+            self.contribution_view_count = torch.cat(
+                [self.contribution_view_count, self.contribution_view_count[selected_pts_mask].repeat(N)])
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, alpha_preserving=False):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -787,18 +829,39 @@ class RefGaussianModel:
         new_indirect_rest = self._indirect_rest[selected_pts_mask]
         
         new_opacities = self._opacity[selected_pts_mask]
+        if alpha_preserving and bool(selected_pts_mask.any()):
+            # a clone is two coincident copies: give BOTH 1-sqrt(1-a) so their composited
+            # alpha equals the original's (stock keeps a on both -> alpha and N_eff ~double)
+            a = self.get_opacity[selected_pts_mask].clamp(1e-6, 1.0 - 1e-6)
+            logits = self.inverse_opacity_activation((1.0 - torch.sqrt(1.0 - a)).clamp(1e-4, 1.0 - 1e-4))
+            self._opacity.data[selected_pts_mask] = logits  # the surviving original of the pair
+            new_opacities = logits                          # the copy
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_metallic, new_roughness, new_base_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_rest, new_opacities, new_scaling, new_rotation)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+        # single-layer: cloned copies inherit the parent's contribution stats
+        if getattr(self, "contribution_accum", torch.empty(0)).shape[0] == selected_pts_mask.shape[0]:
+            self.contribution_accum = torch.cat(
+                [self.contribution_accum, self.contribution_accum[selected_pts_mask]])
+            self.contribution_view_count = torch.cat(
+                [self.contribution_view_count, self.contribution_view_count[selected_pts_mask]])
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, alpha_preserving=False,
+                          clone_as_split=False):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         if self.get_opacity.shape[0] < 20_000_000:
-            self.densify_and_clone(grads, max_grad, extent)
-            self.densify_and_split(grads, max_grad, extent)
+            if clone_as_split:
+                # (S) route BOTH branches through split: small (clone-target) and large surfels
+                # are subdivided in-plane instead of the small ones being cloned (stacked) in place.
+                self.densify_and_split(grads, max_grad, extent, alpha_preserving=alpha_preserving,
+                                       include_small=True)
+            else:
+                self.densify_and_clone(grads, max_grad, extent, alpha_preserving=alpha_preserving)
+                self.densify_and_split(grads, max_grad, extent, alpha_preserving=alpha_preserving)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -809,8 +872,11 @@ class RefGaussianModel:
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, radiosity_tensor=None):
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, radiosity_tensor=None, clean_grad=None):
+        # single-layer (G): clean_grad is the viewspace gradient from the photometric/geometric
+        # losses only (N_eff term excluded) so densification isn't steered by the ironing loss.
+        grad_src = clean_grad if clean_grad is not None else viewspace_point_tensor.grad
+        self.xyz_gradient_accum[update_filter] += torch.norm(grad_src[update_filter], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
     
     def update_mesh(self, mesh):
