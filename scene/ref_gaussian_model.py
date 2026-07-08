@@ -704,6 +704,40 @@ class RefGaussianModel:
               f"pruned={pruned} -> {n - pruned}/{n} kept", flush=True)
         return pruned
 
+    def subdivide_large(self, scale_mult=3.0, max_frac=0.2):
+        """Chop oversized surfels into 4 quadrant children in the splat plane
+        (offsets +-0.5*s_u*tu +-0.5*s_v*tv, scale/2, inherited attrs). One surfel
+        shades to ONE rgb downstream, so shadow gradients need surfel boundaries;
+        textureless regions (plates) never densify from image gradients."""
+        smax = torch.max(self.get_scaling, dim=1).values
+        thresh = scale_mult * smax.median()
+        mask = smax > thresh
+        cap = int(max_frac * smax.shape[0])
+        if int(mask.sum()) > cap:
+            keep = torch.topk(smax, cap).indices
+            mask = torch.zeros_like(mask)
+            mask[keep] = True
+        n = int(mask.sum())
+        if n == 0:
+            return 0
+        R = build_rotation(self._rotation[mask])
+        s = self.get_scaling[mask]
+        su = s[:, 0:1] * R[:, :, 0]
+        sv = s[:, 1:2] * R[:, :, 1]
+        xyz_m = self.get_xyz[mask]
+        new_xyz = torch.cat([xyz_m + du * su + dv * sv
+                             for du, dv in ((0.5, 0.5), (0.5, -0.5), (-0.5, 0.5), (-0.5, -0.5))], 0)
+        rep = lambda t: t[mask].repeat(4, *([1] * (t.dim() - 1)))
+        new_scaling = self.scaling_inverse_activation(s.repeat(4, 1) / 2.0)
+        self.densification_postfix(new_xyz, rep(self._metallic), rep(self._roughness),
+                                   rep(self._base_color), rep(self._features_dc),
+                                   rep(self._features_rest), rep(self._indirect_dc),
+                                   rep(self._indirect_rest), rep(self._opacity),
+                                   new_scaling, rep(self._rotation))
+        prune_mask = torch.cat([mask, torch.zeros(4 * n, dtype=torch.bool, device=mask.device)])
+        self.prune_points(prune_mask)
+        return n
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

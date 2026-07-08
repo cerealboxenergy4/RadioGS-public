@@ -80,6 +80,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # single-layer: last mask0 reset seen (gates the early contrib prune; on resume, treating
     # the resume point as a reset just delays the first prune by the margin)
     last_reset0_iter = first_iter
+    # on a resume past densify_until_iter the densify block (sole assigner) never
+    # runs, so the mesh-extract gate would hit UnboundLocalError without this
+    HAS_RESET0 = False
     first_iter += 1
     iteration = first_iter
 
@@ -305,6 +308,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     and opt.visibility_prune_from_iter <= iteration <= opt.visibility_prune_until_iter
                     and iteration % opt.visibility_prune_interval == 0):
                 gaussians.visibility_prune(opt.visibility_prune_thresh, 1, opt.visibility_prune_max_fraction)
+
+            # single-layer: pre-fit subdivision — also outside the densify guard; schedule
+            # after vprune ends so children get an undisturbed photometric settle window.
+            if opt.subdivide_at_iter > 0 and iteration == opt.subdivide_at_iter:
+                nsub = gaussians.subdivide_large(opt.subdivide_scale_mult)
+                print(f"\n[subdivide] iter {iteration}: chopped {nsub} surfels -> +{3 * nsub} net", flush=True)
 
             if (iteration >= opt.indirect_from_iter and iteration % MESH_EXTRACT_INTERVAL == 0) or iteration == (opt.indirect_from_iter):
                 if not HAS_RESET0:

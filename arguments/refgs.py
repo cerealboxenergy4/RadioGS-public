@@ -146,6 +146,12 @@ class OptimizationParams(ParamGroup):
         self.visibility_prune_until_iter = 30_000
         self.visibility_prune_thresh = 0.05
         self.visibility_prune_max_fraction = 0.0
+        # pre-fit subdivision: chop oversized surfels into 4 quadrant children so
+        # downstream per-surfel shading (SCIR: one rgb per surfel) has boundaries
+        # where shadow gradients need them; schedule BEFORE the end of stage 1 so
+        # children settle photometrically.
+        self.subdivide_at_iter = 0             # 0 = off
+        self.subdivide_scale_mult = 3.0        # chop if smax > mult * median(smax)
 
         # ---- single-layer densify/prune machinery adaptations ----
         # (1) alpha-preserving clone/split: overlapping children get 1-(1-a)^(1/N) so the
