@@ -99,7 +99,7 @@ if __name__ == '__main__':
     # Create the task dictionary dynamically
     task_dict = {
         f"envmap_{hdr_file[:-4]}": {
-            "capture_list": ["render", "render_env", "render_direct", "render_indirect", "light_direct", "light_indirect"],
+            "capture_list": ["render", "render_env", "render_direct", "render_indirect", "light_direct", "light_indirect", "visibility"],
             "envmap_path": os.path.join(envmap_dir, hdr_file),
         }
         for hdr_file in hdr_files
