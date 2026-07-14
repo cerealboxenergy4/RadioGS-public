@@ -173,7 +173,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # first_hit_pbr: seed the first-hit gathered L_ind so iter 1 renders with it (the incident
     # cache holds visibility only at this point => shadowed direct diffuse at the hits).
     if getattr(pipe, 'first_hit_pbr', False):
-        gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
+        gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling,
+                                           hit_mode=getattr(pipe, 'fhpbr_hit_mode', 'first_accepted'),
+                                           n_prefix=getattr(pipe, 'fhpbr_prefix_k', 8),
+                                           toksvig=getattr(pipe, 'fhpbr_virtual_toksvig', 1.0))
 
     while iteration < opt.iterations + 1:
         iter_start.record()
@@ -193,7 +196,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # first_hit_pbr: re-gather the per-ray first-hit L_ind from the refreshed cache
             # (each refresh deepens the effective bounce depth by one).
             if getattr(pipe, 'first_hit_pbr', False):
-                gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling)
+                gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min, back_culling=pipe.back_culling,
+                                                   hit_mode=getattr(pipe, 'fhpbr_hit_mode', 'first_accepted'),
+                                                   n_prefix=getattr(pipe, 'fhpbr_prefix_k', 8),
+                                                   toksvig=getattr(pipe, 'fhpbr_virtual_toksvig', 1.0))
             refresh_end.record()
 
         # radiosity: multi-bounce diffuse solve feeding rendering_equation's indirect_diffuse.

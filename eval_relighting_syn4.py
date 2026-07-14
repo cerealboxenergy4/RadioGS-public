@@ -52,7 +52,9 @@ if __name__ == '__main__':
     # load gaussians
     # gaussians = GaussianModel(3)
     # 
-    gaussians = RadioGSModel(3)
+    # single-layer: plumb transmittance_min so --transmittance_min actually reaches the tracer
+    # (without this the CLI flag was silently stuck at the RadioGSModel ctor default of 0.03).
+    gaussians = RadioGSModel(3, transmittance_min=dataset.transmittance_min)
     gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
     gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
     # single-layer: turn on trace-cost instrumentation (mean k_eff = accepted hits / ray).
@@ -189,6 +191,16 @@ if __name__ == '__main__':
                     gaussians.update_incidents_directions(incident_dirs, incident_areas)
                     features = torch.cat([gaussians.get_base_color, gaussians.get_rough], dim=1)
                     gaussians.precompute_incidents(light_t_min=pipe.light_t_min, only_vis=False, features=features, relight=True, back_culling=pipe.back_culling)
+                    # single-layer: first-hit PBR gather off the just-filled env-PBR incident cache
+                    # (mirrors eval_relighting_tensoir.py). Without this the fhpbr swap in the renderer
+                    # never fires on S4R because _first_hit_pbr_ind stays None -> --first_hit_pbr was a no-op.
+                    if getattr(pipe, 'first_hit_pbr', False):
+                        gaussians.precompute_first_hit_pbr(light_t_min=pipe.light_t_min,
+                                                           back_culling=pipe.back_culling,
+                                                           base_color_scale=base_color_scale,
+                                                           hit_mode=getattr(pipe, 'fhpbr_hit_mode', 'first_accepted'),
+                                                           n_prefix=getattr(pipe, 'fhpbr_prefix_k', 8),
+                                                           toksvig=getattr(pipe, 'fhpbr_virtual_toksvig', 1.0))
 
             with torch.no_grad():
                 render_pkg = render_radiogs(viewpoint_camera=custom_cam, **render_kwargs)
@@ -233,6 +245,9 @@ if __name__ == '__main__':
     cand_per_ray, keff, n_rays = gaussians.gaussian_tracer.read_counters()
     results_dict["trace_cost"] = {"k_eff": keff, "candidates_per_ray": cand_per_ray, "n_rays": n_rays,
                                   "first_hit_only": bool(gaussians.first_hit_only),
+                                  "transmittance_min": float(gaussians.gaussian_tracer.transmittance_min),
+                                  "first_hit_pbr": bool(getattr(pipe, 'first_hit_pbr', False)),
+                                  "fhpbr_hit_mode": getattr(pipe, 'fhpbr_hit_mode', 'first_accepted'),
                                   "super_gaussian_order": float(gaussians.super_gaussian_order),
                                   "n_surfels": int(gaussians.get_xyz.shape[0])}
     print("[trace-cost] k_eff(mean accepted hits/ray)={:.4f}  candidates/ray={:.4f}  rays={}  "
