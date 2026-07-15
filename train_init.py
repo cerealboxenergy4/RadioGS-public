@@ -380,6 +380,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     and iteration % opt.visibility_prune_interval == 0):
                 gaussians.visibility_prune(opt.visibility_prune_thresh, 1, opt.visibility_prune_max_fraction)
 
+            # 2D-SuGaR clustering-prune baseline (spatial truncation, contrast to smooth ironing):
+            # DBSCAN over surfel centers, keep only the largest connected cluster. Fired here
+            # (post-densify, alongside vprune) so the reduction is stable in the handed-off checkpoint;
+            # opt.cluster_prune_iterations is empty (= off) for every stock/ironed run.
+            if opt.cluster_prune_iterations and iteration in opt.cluster_prune_iterations:
+                gaussians.cluster_prune(opt.cluster_prune_eps, opt.cluster_prune_min_samples,
+                                        opt.cluster_prune_knn_k, opt.cluster_prune_knn_percentile,
+                                        opt.cluster_prune_min_cluster_size)
+
             # single-layer: pre-fit subdivision — also outside the densify guard; schedule
             # after vprune ends so children get an undisturbed photometric settle window.
             if opt.subdivide_at_iter > 0 and iteration == opt.subdivide_at_iter:
@@ -612,6 +621,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[10000,20000,30000,40000,50000,60000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    # 2D-SuGaR clustering-prune baseline: iterations at which to run the DBSCAN largest-cluster prune
+    # (empty = off). Declared here (not in OptimizationParams) so nargs values keep int type; attached
+    # to the opt namespace below so the training loop reads it via opt.cluster_prune_iterations.
+    parser.add_argument("--cluster_prune_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.checkpoint_iterations.append(args.iterations)
@@ -637,7 +650,9 @@ if __name__ == "__main__":
 
     # Start GUI server, configure and run training
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
+    op_ns = op.extract(args)
+    op_ns.cluster_prune_iterations = args.cluster_prune_iterations  # int-typed list from the main parser
+    training(lp.extract(args), op_ns, pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
 
     # All done
     print("\nTraining complete.")

@@ -196,6 +196,16 @@ class OptimizationParams(ParamGroup):
         self.pup_fisher_views = -1           # #train views to subsample for scoring; -1 = all
         self.pup_fisher_ridge = 1e-9         # eigenvalue floor for the logdet
 
+        # ---- 2D-SuGaR clustering-prune baseline (spatial truncation; contrast to smooth ironing) ----
+        # DBSCAN on surfel centers, keep only the largest connected cluster, drop islands + noise.
+        # Enable by passing --cluster_prune_iterations (declared as a nargs list in train_init.py);
+        # these scalars mirror 2D-SuGaR's estimate_eps / DBSCAN defaults (min_samples=knn_k=4, p=98).
+        self.cluster_prune_eps = 0.0            # 0 = auto (knn-percentile); else fixed DBSCAN eps
+        self.cluster_prune_min_samples = 4      # DBSCAN min_samples
+        self.cluster_prune_knn_k = 4            # k-th neighbour used for the eps estimate
+        self.cluster_prune_knn_percentile = 98.0  # percentile of k-th-NN distances -> eps
+        self.cluster_prune_min_cluster_size = 0   # safety floor (0 = off = paper behaviour)
+
         self.lambda_base_color_smooth = 0.0
         self.lambda_roughness_smooth = 0.0
         self.lambda_metallic_smooth = 0.0
