@@ -35,6 +35,63 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+def pup_fisher_prune(gaussians, cameras, pipe, bg, opt, iteration, prune_percent,
+                     n_draws=4, n_views=-1, ridge=1e-9, seed=1234):
+    """PUP-3DGS pruning adapted to 2DGS surfels. Per-Gaussian sensitivity
+    U_g = logdet(H_g), H_g = sum_pixels g_p g_p^T over the SPATIAL params
+    [xyz(3), scaling(2)] -> 5x5 block (rotation/opacity/color excluded, faithful
+    to PUP). H_g is estimated by a Hutchinson random-projection: for a +/-1
+    pixel-sign mask r (iid), one backward of (r*I).sum() gives
+    g = sum_p r_p dI_p/dtheta in [N,5]; E[g g^T] = H_g exactly. Reuses the
+    differentiable volume render (render_volume['render']), NOT the no-grad
+    render_contribution. Prunes exactly the lowest-U_g `prune_percent` of the
+    CURRENT count via topk (precise budget). Uses a local RNG so it does not
+    perturb the training RNG stream, and autograd.grad so it never writes .grad."""
+    xyz, scaling = gaussians._xyz, gaussians._scaling            # leaves; grad -> [mu(3), s(2)]
+    N = xyz.shape[0]
+    gen = torch.Generator(device="cuda").manual_seed(int(seed) + int(iteration))
+    H = torch.zeros(N, 5, 5, device="cuda", dtype=torch.float64)
+
+    cams = list(cameras)
+    if n_views is not None and 0 < int(n_views) < len(cams):
+        sel = torch.randperm(len(cams), generator=gen, device="cuda")[:int(n_views)].tolist()
+        cams = [cams[i] for i in sel]
+
+    for cam in cams:
+        rpkg = render_volume(cam, gaussians, pipe, bg, srgb=pipe.srgb,
+                             opt=opt, training=False, iteration=iteration)
+        img = rpkg["render"]                                     # [3,H,W], diff wrt xyz, scaling
+        for m in range(int(n_draws)):
+            r = (torch.randint(0, 2, img.shape, generator=gen, device="cuda",
+                               dtype=img.dtype) * 2 - 1)
+            retain = m < int(n_draws) - 1
+            g_xyz, g_s = torch.autograd.grad((r * img).sum(), (xyz, scaling),
+                                             retain_graph=retain)
+            g = torch.cat([g_xyz, g_s], dim=1).double()          # [N,5]
+            H += g.unsqueeze(2) * g.unsqueeze(1)                 # [N,5,5]
+        del rpkg, img
+    H /= max(1, len(cams) * int(n_draws))                        # monotone; ranking unchanged
+
+    trace = H.diagonal(dim1=1, dim2=2).sum(-1)                  # [N]
+    eig = torch.linalg.eigvalsh(H)                              # ascending; H is symmetric PSD
+    score = torch.log(eig.clamp_min(float(ridge))).sum(-1)     # logdet -> U_g, [N]
+    score[trace <= 0] = -float("inf")                          # invisible -> pruned first (PUP filter)
+
+    k = int(round(N * float(prune_percent)))
+    k = max(0, min(k, N - 1))
+    if k <= 0:
+        print(f"[pup] iter {iteration}: prune_percent={prune_percent} -> k=0, skipped", flush=True)
+        return
+    prune_idx = torch.topk(score, k, largest=False).indices     # exactly the k lowest-scoring
+    prune_mask = torch.zeros(N, dtype=torch.bool, device="cuda")
+    prune_mask[prune_idx] = True
+    gaussians.prune_points(prune_mask)
+    torch.cuda.empty_cache()
+    print(f"[pup] iter {iteration}: Fisher-pruned {k} ({100*k/N:.1f}%) -> "
+          f"{gaussians.get_xyz.shape[0]} gaussians (views={len(cams)}, draws={n_draws})",
+          flush=True)
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
     first_iter = 0
     tb_writer = prepare_output_and_logger()
@@ -127,6 +184,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Control the radiosity stage
         if iteration == opt.radiosity_from_iter+1:
             opt.radiosity = 1
+
+        # PUP-3DGS pruning baseline (default off): post-hoc Fisher/GN sensitivity prune of
+        # the converged model, then recover by continued fine-tune. Runs BEFORE the train
+        # step so the rest of the iteration operates on the pruned set; .grad is None here.
+        if opt.pup_prune:
+            _pup_iters = [int(x) for x in opt.pup_prune_iters]
+            if iteration in _pup_iters:
+                _pup_pcts = [float(x) for x in opt.pup_prune_percent]
+                _pct = _pup_pcts[_pup_iters.index(iteration)]
+                pup_fisher_prune(gaussians, scene.getTrainCameras(), pipe, background,
+                                 opt, iteration, _pct,
+                                 n_draws=int(opt.pup_fisher_draws),
+                                 n_views=int(opt.pup_fisher_views),
+                                 ridge=float(opt.pup_fisher_ridge))
 
         # Pick a random Camera
         if not viewpoint_stack:
