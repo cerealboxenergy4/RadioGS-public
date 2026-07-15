@@ -704,6 +704,50 @@ class RefGaussianModel:
               f"pruned={pruned} -> {n - pruned}/{n} kept", flush=True)
         return pruned
 
+    # ---- 2D-SuGaR clustering prune (baseline: spatial truncation, contrast to smooth ironing) ----
+    def cluster_prune(self, eps=0.0, min_samples=4, knn_k=4, knn_percentile=98.0, min_cluster_size=0):
+        """DBSCAN clustering prune ported faithfully from 2D-SuGaR (Divyam et al., EG'26),
+        gaussian_splatting_2d/scene/gaussian_model.py::cluster_gaussians + the train.py invocation:
+        run DBSCAN on the surfel centers, keep ONLY the largest connected cluster, and prune every
+        other cluster plus all DBSCAN noise points (mask = labels != argmax-cluster). eps is
+        auto-estimated (when eps<=0) as the knn_percentile-th percentile of each point's distance to
+        its knn_k-th nearest neighbour (the paper's estimate_eps; defaults min_samples=knn_k=4,
+        percentile=98). This is a hard *spatial* truncation baseline: unlike single-layer ironing
+        (a smooth per-ray N_eff overlap penalty) it removes whole primitives by spatial connectivity.
+        Returns the number of surfels pruned."""
+        from sklearn.cluster import DBSCAN
+        from sklearn.neighbors import NearestNeighbors
+        n = self.get_xyz.shape[0]
+        pts = self.get_xyz.detach().cpu().numpy()
+        if eps is None or eps <= 0.0:
+            k = max(2, int(knn_k))
+            nbrs = NearestNeighbors(n_neighbors=k).fit(pts)
+            dists, _ = nbrs.kneighbors(pts)
+            eps = float(np.percentile(dists[:, -1], knn_percentile))  # distance to the k-th neighbour
+        labels = DBSCAN(eps=eps, min_samples=int(min_samples)).fit_predict(pts)
+        uniq, counts = np.unique(labels[labels >= 0], return_counts=True)  # non-noise clusters only
+        if uniq.size == 0:  # everything is noise -> "largest cluster" undefined; no-op (paper would crash)
+            print(f"[cluster-prune] eps={eps:.5f} clusters=0 noise={n} -> no-op, kept {n}/{n}", flush=True)
+            return 0
+        retained = int(uniq[int(np.argmax(counts))])
+        retained_size = int(counts.max())
+        # safety floor (default off, = paper behaviour): never amputate the object if even the biggest
+        # cluster is smaller than min_cluster_size.
+        if min_cluster_size > 0 and retained_size < min_cluster_size:
+            print(f"[cluster-prune] eps={eps:.5f} largest cluster {retained_size} < min "
+                  f"{min_cluster_size} -> no-op, kept {n}/{n}", flush=True)
+            return 0
+        mask = torch.from_numpy(labels != retained).to(self.get_xyz.device)
+        pruned = int(mask.sum().item())
+        if pruned > 0:
+            self.prune_points(mask)
+            if getattr(self, "contribution_accum", torch.empty(0)).shape[0] != self.get_xyz.shape[0]:
+                self.reset_contribution_stats()  # sizes changed; rebuild vprune stats
+        print(f"[cluster-prune] eps={eps:.5f} clusters={int(uniq.size)} retained={retained} "
+              f"(size {retained_size}) noise={int((labels < 0).sum())} "
+              f"pruned={pruned} -> {n - pruned}/{n} kept", flush=True)
+        return pruned
+
     def subdivide_large(self, scale_mult=3.0, max_frac=0.2):
         """Chop oversized surfels into 4 quadrant children in the splat plane
         (offsets +-0.5*s_u*tu +-0.5*s_v*tv, scale/2, inherited attrs). One surfel
