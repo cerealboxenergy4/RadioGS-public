@@ -184,6 +184,18 @@ class OptimizationParams(ParamGroup):
         #     single-layer-friendly lateral subdivision (may over-fragment / under-cover detail).
         self.densify_clone_as_split = False
 
+        # ---- PUP-3DGS baseline (Fisher/GN sensitivity pruning, adapted to 2DGS; default off) ----
+        # Per-Gaussian score U_g = logdet(H_g), H_g = sum_pixels g_p g_p^T over the SPATIAL
+        # params [xyz(3), scaling(2)] -> 5x5 (rotation/opacity/color excluded, faithful to PUP).
+        # H_g estimated by a Hutchinson random-projection (unbiased for PUP's exact Fisher):
+        # for a +/-1 pixel-sign mask r, one backward of (r*I).sum() gives g = sum_p r_p dI_p/dtheta.
+        self.pup_prune = False               # 0 = off, stock behavior bit-exact
+        self.pup_prune_iters = [40100]       # iterations at which to prune (list; rounds)
+        self.pup_prune_percent = [0.4]       # per-round fraction of the CURRENT count (len == iters)
+        self.pup_fisher_draws = 4            # M Hutchinson +/-1 draws per view
+        self.pup_fisher_views = -1           # #train views to subsample for scoring; -1 = all
+        self.pup_fisher_ridge = 1e-9         # eigenvalue floor for the logdet
+
         self.lambda_base_color_smooth = 0.0
         self.lambda_roughness_smooth = 0.0
         self.lambda_metallic_smooth = 0.0
