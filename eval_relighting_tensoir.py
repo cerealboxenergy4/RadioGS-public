@@ -304,16 +304,21 @@ if __name__ == '__main__':
           results_dict["render_time_ms_per_view_avg"], results_dict["precompute_s_avg"]))
     print("\nEvaluating AVG: PSNR_PBR {: .4f} SSIM_PBR {: .4f} LPIPS_PBR {: .4f}".format(results_dict["psnr_pbr_avg"], results_dict["ssim_pbr_avg"], results_dict["lpips_pbr_avg"]))
     # single-layer: report trace-cost spine (the Part-2 cost axis / north-star number).
-    cand_per_ray, keff, n_rays = gaussians.gaussian_tracer.read_counters()
-    results_dict["trace_cost"] = {"k_eff": keff, "candidates_per_ray": cand_per_ray, "n_rays": n_rays,
+    # trace-opt review fix: read_counters now returns every ray population separately; k_eff is
+    # accepted_hits / rays_accepted (bounds-independent denominator — the old per-candidate-ray
+    # value is k_eff_per_candidate_ray, comparable to pre-trace-opt JSONs only at order 2).
+    tc = gaussians.gaussian_tracer.read_counters() or {}
+    results_dict["trace_cost"] = {**tc, "k_eff_denominator": "rays_accepted",
+                                  "n_rays": tc.get("rays_candidate", 0),  # legacy field (candidate rays)
                                   "first_hit_only": bool(gaussians.first_hit_only),
                                   "super_gaussian_order": float(gaussians.super_gaussian_order),
                                   "transmittance_min": float(gaussians.gaussian_tracer.transmittance_min),
                                   "n_surfels": int(gaussians.get_xyz.shape[0])}
-    print("[trace-cost] k_eff(mean accepted hits/ray)={:.4f}  candidates/ray={:.4f}  rays={}  "
-          "first_hit_only={}  order={}  N_surfel={}".format(
-          keff, cand_per_ray, n_rays, gaussians.first_hit_only, gaussians.super_gaussian_order,
-          gaussians.get_xyz.shape[0]))
+    print("[trace-cost] k_eff(accepted hits / accepted ray)={:.4f}  candidates/ray={:.4f}  "
+          "rays launched/candidate/accepted={}/{}/{}  first_hit_only={}  order={}  N_surfel={}".format(
+          tc.get("k_eff", 0.0), tc.get("candidates_per_ray", 0.0), tc.get("rays_launched", 0),
+          tc.get("rays_candidate", 0), tc.get("rays_accepted", 0), gaussians.first_hit_only,
+          gaussians.super_gaussian_order, gaussians.get_xyz.shape[0]))
     with open(os.path.join(results_dir, "relighting_results.json"), "w") as f:
         json.dump(results_dict, f, indent=4)
     print("Results saved to", os.path.join(results_dir, "relighting_results.json"))

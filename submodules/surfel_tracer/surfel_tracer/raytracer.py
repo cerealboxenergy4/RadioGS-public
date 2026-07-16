@@ -90,21 +90,37 @@ class GaussianTracer():
         self.impl = _C.create_gaussiantracer()
         self.transmittance_min = transmittance_min
         # single-layer: trace-cost instrumentation. When collect_counters is True, trace() accumulates
-        # [candidate_intersections, accepted_hits (k_eff), rays] into counter_accum across calls.
+        # [candidate_sum, accepted_hit_sum, rays_launched, rays_candidate, rays_accepted] into
+        # counter_accum across calls (see gaussiantrace_forward.cu).
         self.collect_counters = False
         self.counter_accum = None
 
     def reset_counters(self):
-        self.counter_accum = torch.zeros(3, dtype=torch.int64, device='cuda')
+        self.counter_accum = torch.zeros(5, dtype=torch.int64, device='cuda')
 
     def read_counters(self):
-        """Return (mean_candidates_per_ray, mean_keff_per_ray, n_rays). k_eff = mean accepted hits/ray."""
+        """Trace-cost counters as a dict. Sums: candidates, accepted_hits. Ray populations:
+        rays_launched (every ray the kernel ran), rays_candidate (>=1 buffered BVH candidate),
+        rays_accepted (>=1 alpha-accepted hit). The candidate-ray set depends on how tight the
+        BVH bounds are, so 'k_eff' uses rays_accepted — a bounds- and pre-pass-independent
+        denominator (the accepted set only depends on the kernel's alpha_min test). The
+        per-candidate-ray / per-launched-ray variants are reported alongside."""
         if self.counter_accum is None:
-            return (0.0, 0.0, 0)
-        cand, khit, rays = [int(x) for x in self.counter_accum.tolist()]
-        if rays == 0:
-            return (0.0, 0.0, 0)
-        return (cand / rays, khit / rays, rays)
+            return None
+        cand, khit, launched, cand_rays, acc_rays = [int(x) for x in self.counter_accum.tolist()]
+        div = lambda a, b: (a / b) if b else 0.0
+        return {
+            "candidates": cand,
+            "accepted_hits": khit,
+            "rays_launched": launched,
+            "rays_candidate": cand_rays,
+            "rays_accepted": acc_rays,
+            "k_eff": div(khit, acc_rays),
+            "k_eff_per_candidate_ray": div(khit, cand_rays),
+            "k_eff_per_launched_ray": div(khit, launched),
+            "candidates_per_ray": div(cand, cand_rays),
+            "candidates_per_launched_ray": div(cand, launched),
+        }
 
     def build_bvh(self, vertices_b, faces_b, gs_idxs):
         self.faces_b = faces_b

@@ -162,15 +162,19 @@ extern "C" __global__ void __raygen__rg() {
 		params.feature[idx.x * params.S + i] = F[i];
 	}
 
-	// single-layer: accumulate global trace-cost counters (candidates, accepted hits = k_eff).
-	// Optional: only when a counter buffer was provided (eval-time measurement, off in training).
-	// trace-opt: the intersection_test pre-pass is gone, so all rays launch; count a ray in the
-	// denominator only if it buffered >=1 candidate — exactly the set the pre-pass used to pass
-	// (same BVH, same geometry), keeping k_eff comparable across runs.
-	if (params.counters != nullptr && kcand > 0){
+	// single-layer: accumulate global trace-cost counters. Optional: only when a counter buffer
+	// was provided (eval-time measurement, off in training). trace-opt review fix: the candidate-ray
+	// set DEPENDS on how tight the BVH bounds are (tight bounds halve it at SG6), so a k_eff over
+	// candidate rays is not comparable across bound changes. Record every population separately —
+	// [0] candidate sum, [1] accepted-hit sum, [2] rays launched, [3] rays with >=1 buffered
+	// candidate, [4] rays with >=1 accepted hit — and let the reader pick its denominator
+	// (accepted-hit rays are bounds- and pre-pass-independent).
+	if (params.counters != nullptr){
 		atomicAdd(params.counters + 0, (unsigned long long)kcand);
 		atomicAdd(params.counters + 1, (unsigned long long)khit);
-		atomicAdd(params.counters + 2, (unsigned long long)1);  // ray count (rays that hit the BVH)
+		atomicAdd(params.counters + 2, (unsigned long long)1);
+		if (kcand > 0) atomicAdd(params.counters + 3, (unsigned long long)1);
+		if (khit > 0) atomicAdd(params.counters + 4, (unsigned long long)1);
 	}
 }
 
