@@ -111,6 +111,10 @@ class PipelineParams(ParamGroup):
         # First-hit trace mode: terminate each traced ray at its first accepted surfel (k_eff := 1).
         # The literal realization of the single-layer north-star; an eval-time extreme. Default off.
         self.first_hit_only = False
+        # trace-opt: per-round K-nearest gather size in the ray tracer (result is exact for any K;
+        # smaller K lets low-k_eff ironed scenes terminate BVH traversal earlier). 0 = auto:
+        # 1 when first_hit_only, 4 when super_gaussian_order > 2, else 16 (the stock buffer).
+        self.hit_buffer_size = 0
 
         self.wo_indirect = False
         self.wo_indirect_relight = False

@@ -276,7 +276,8 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.normal_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		prefiltered
+		prefiltered,
+		super_gaussian_order
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians

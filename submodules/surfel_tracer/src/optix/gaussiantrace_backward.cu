@@ -33,14 +33,18 @@ extern "C" __global__ void __raygen__rg() {
 
 	float T = 1.0f, t_start = 0.0f, t_curr = 0.0f;
 
+	// trace-opt: active gather size (runtime-bounded loops; must match the forward pass so the
+	// compositing replay visits hits in the identical order).
+	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+
 	HitInfo hitArray[MAX_BUFFER_SIZE];
 	unsigned int hitArrayPtr0 = (unsigned int)((uintptr_t)(&hitArray) & 0xFFFFFFFF);
     unsigned int hitArrayPtr1 = (unsigned int)(((uintptr_t)(&hitArray) >> 32) & 0xFFFFFFFF);
 
 	while ((t_start < T_SCENE_MAX) && (T > params.transmittance_min)){
 		ray_origin = ray_o + t_start * ray_d;
-		
-		for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+
+		for (int i = 0; i < K; ++i) {
 			hitArray[i].t = 1e16f;
 			hitArray[i].primIdx = -1;
 		}
@@ -60,7 +64,7 @@ extern "C" __global__ void __raygen__rg() {
 			hitArrayPtr1
 		);
 
-		for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+		for (int i = 0; i < K; ++i) {
 			int primIdx = hitArray[i].primIdx;
 
 			if (primIdx == -1) {
@@ -189,11 +193,14 @@ extern "C" __global__ void __closesthit__ch() {
 extern "C" __global__ void __anyhit__ah() {
     HitInfo* hitArray = (HitInfo*)((uintptr_t)optixGetPayload_0() | ((uintptr_t)optixGetPayload_1() << 32));
 
+	// trace-opt: runtime-bounded K-nearest insertion (params is visible from the anyhit program).
+	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+
 	float THit = optixGetRayTmax();
     int i_prim = optixGetPrimitiveIndex();
 	HitInfo newHit = {THit, i_prim};
 
-	for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+	for (int i = 0; i < K; ++i) {
 		if (hitArray[i].primIdx == -1){
 			hitArray[i] = newHit;
 			break;
@@ -203,8 +210,8 @@ extern "C" __global__ void __anyhit__ah() {
         }
     }
 
-	if (THit < hitArray[MAX_BUFFER_SIZE - 1].t) {
-        optixIgnoreIntersection(); 
+	if (THit < hitArray[K - 1].t) {
+        optixIgnoreIntersection();
     }
 
 }

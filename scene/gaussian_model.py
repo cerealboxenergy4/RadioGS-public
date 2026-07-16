@@ -750,8 +750,12 @@ class GaussianModel:
         scale = torch.cat([scale, torch.full_like(scale, 1e-6)], dim=-1)
         
         L = build_scaling_rotation(scale, self._rotation)
-        
-        vertices_b = (2 * (opacity/alpha_min).log()).sqrt()[:, None] * (self.unit_icosahedron_vertices[None] @ L.transpose(-1, -2)) + mu[:, None]
+
+        # trace-opt: SGO-aware support radius r = (2*ln(o/alpha_min))^(1/p); p == 2 reproduces the
+        # stock sqrt bound (see radiogs_gaussian_model.get_boundings for the derivation).
+        p = float(getattr(self, "super_gaussian_order", 2.0))
+        r = (2 * (opacity/alpha_min).log()).clamp_min(0.0) ** (1.0 / p)
+        vertices_b = r[:, None] * (self.unit_icosahedron_vertices[None] @ L.transpose(-1, -2)) + mu[:, None]
         faces_b = self.unit_icosahedron_faces[None] + torch.arange(mu.shape[0], device="cuda")[:, None, None] * 12
         gs_id = torch.arange(mu.shape[0], device="cuda")[:, None].expand(-1, faces_b.shape[1])
         return vertices_b.reshape(-1, 3), faces_b.reshape(-1, 3), gs_id.reshape(-1)
@@ -782,8 +786,11 @@ class GaussianModel:
         
         sgo = getattr(self, "super_gaussian_order", 2.0)  # single-layer: ironed footprint order for the tracer
         fho = getattr(self, "first_hit_only", False)      # single-layer: first-hit trace mode (k_eff := 1)
-        if not detach_orientation: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
-        else: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o.detach(), rays_d.detach(), means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals.detach(), features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho)
+        # trace-opt: auto K policy (first-hit -> 1, ironed order>2 -> 4, stock -> 16; override via hit_buffer_size attr)
+        hbs = int(getattr(self, "hit_buffer_size", 0))
+        if hbs <= 0: hbs = 1 if fho else (4 if sgo > 2.0 else 16)
+        if not detach_orientation: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, hit_buffer_size=hbs)
+        else: color, normal, feature, depth, alpha = self.gaussian_tracer.trace(rays_o.detach(), rays_d.detach(), means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals.detach(), features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, hit_buffer_size=hbs)
         
         alpha_ = alpha[..., None]
         color = torch.where(alpha_ < 1 - self.gaussian_tracer.transmittance_min, color, color / alpha_)

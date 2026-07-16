@@ -35,6 +35,10 @@ struct Gaussiantrace_forward {
 		bool back_culling;
 		float super_gaussian_order;
 		bool first_hit_only;              // single-layer: terminate each ray at its first accepted surfel
+		int hit_buffer_size;              // trace-opt: active K-nearest gather size per traversal round
+		                                  // (1..MAX_BUFFER_SIZE). Smaller K commits tmax sooner on ironed
+		                                  // scenes (low k_eff) so the BVH culls the tail; exact for any K
+		                                  // because the outer relaunch loop resumes past the K-th hit.
 		unsigned long long* counters;     // single-layer: [candidates, accepted_hits(k_eff), rays] (nullable)
 		OptixTraversableHandle handle;
 	};

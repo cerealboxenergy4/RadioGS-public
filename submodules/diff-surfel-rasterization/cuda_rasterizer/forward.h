@@ -46,7 +46,8 @@ namespace FORWARD
 		float4* normal_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
-		bool prefiltered);
+		bool prefiltered,
+		float super_gaussian_order);
 
 	// Main rasterization method.
 	void render(

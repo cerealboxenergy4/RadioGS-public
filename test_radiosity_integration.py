@@ -38,6 +38,7 @@ def main():
 
     g = GaussianModel(3)
     g.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)
+    g.hit_buffer_size = getattr(pipe, "hit_buffer_size", 0)  # trace-opt: 0 = auto K policy
     g.first_hit_only = getattr(pipe, "first_hit_only", False)
     g.load_ply(PLY)
     g.active_sh_degree = g.max_sh_degree

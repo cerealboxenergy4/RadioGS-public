@@ -780,10 +780,18 @@ class GaussianModel:
         opacity = self.get_opacity
         scale = self.get_scaling
         scale = torch.cat([scale, torch.full_like(scale, 1e-6)], dim=-1)
-        
+
         L = build_scaling_rotation(scale, self._rotation)
-        
-        vertices_b = (2 * (opacity/alpha_min).log()).sqrt()[:, None] * (self.unit_icosahedron_vertices[None] @ L.transpose(-1, -2)) + mu[:, None]
+
+        # trace-opt: SGO-aware support radius. The tracer accepts alpha = o*exp(-0.5*r^p) >= alpha_min,
+        # so the exact bound is r = (2*ln(o/alpha_min))^(1/p); p == 2 reproduces the stock sqrt bound.
+        # Candidates trimmed by the tighter bound fail the kernel's alpha_min test anyway, so the
+        # rendered output is unchanged — only the BVH candidate set shrinks. Sub-threshold Gaussians
+        # (o <= alpha_min) can never contribute -> clamp to a zero-size bound (also fixes a latent
+        # NaN from sqrt of a negative log-ratio).
+        p = float(getattr(self, "super_gaussian_order", 2.0))
+        r = (2 * (opacity/alpha_min).log()).clamp_min(0.0) ** (1.0 / p)
+        vertices_b = r[:, None] * (self.unit_icosahedron_vertices[None] @ L.transpose(-1, -2)) + mu[:, None]
         faces_b = self.unit_icosahedron_faces[None] + torch.arange(mu.shape[0], device="cuda")[:, None, None] * 12
         gs_id = torch.arange(mu.shape[0], device="cuda")[:, None].expand(-1, faces_b.shape[1])
         return vertices_b.reshape(-1, 3), faces_b.reshape(-1, 3), gs_id.reshape(-1)
@@ -796,6 +804,18 @@ class GaussianModel:
         vertices_b, faces_b, gs_id = self.get_boundings(alpha_min=self.alpha_min)
         self.gaussian_tracer.update_bvh(vertices_b, faces_b, gs_id)
         
+    def _trace_hit_buffer_size(self, sgo, fho):
+        # trace-opt: active K-nearest gather size per traversal round (see surfel_tracer kernels).
+        # 0 = auto policy: first-hit trace needs only the nearest candidate (K=1); ironed footprints
+        # (order > 2) collapse k_eff to ~1-3 so a small buffer commits tmax early and lets the BVH
+        # cull the tail (K=4); stock order-2 keeps the original deep gather (K=16). Exact for any K.
+        hbs = int(getattr(self, "hit_buffer_size", 0))
+        if hbs > 0:
+            return hbs
+        if fho:
+            return 1
+        return 4 if sgo > 2.0 else 16
+
     def trace(self, rays_o, rays_d, features=None, camera_center=None, back_culling=False, detach_orientation=False, return_hit_idx=False):
         means3D = self.get_xyz
         shs = self.get_features
@@ -815,10 +835,11 @@ class GaussianModel:
         # first_hit_pbr: the kernel already records each ray's first-accepted surfel while
         # compositing, so return_hit_idx surfaces it for free (no second trace needed).
         hit_idx = None
+        hbs = self._trace_hit_buffer_size(sgo, fho)  # trace-opt
         if not detach_orientation:
-            outs = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=return_hit_idx)
+            outs = self.gaussian_tracer.trace(rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=return_hit_idx, hit_buffer_size=hbs)
         else:
-            outs = self.gaussian_tracer.trace(rays_o, rays_d, means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=return_hit_idx)
+            outs = self.gaussian_tracer.trace(rays_o, rays_d, means3D.detach(), opacity.detach(), ru.detach(), rv.detach(), normals, features, shs, alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling, super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=return_hit_idx, hit_buffer_size=hbs)
         if return_hit_idx: color, normal, feature, depth, alpha, hit_idx = outs
         else: color, normal, feature, depth, alpha = outs
 
@@ -860,7 +881,8 @@ class GaussianModel:
         _, _, _, _, alpha, alpha_m2 = self.gaussian_tracer.trace(
             rays_o, rays_d, means3D, opacity, ru, rv, normals, None, shs,
             alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling,
-            super_gaussian_order=sgo, first_hit_only=False, return_alpha_m2=True)
+            super_gaussian_order=sgo, first_hit_only=False, return_alpha_m2=True,
+            hit_buffer_size=self._trace_hit_buffer_size(sgo, False))
         return alpha, alpha_m2
 
     @torch.no_grad()
@@ -885,7 +907,8 @@ class GaussianModel:
         _, _, _, _, alpha, hit_idx = self.gaussian_tracer.trace(
             rays_o, rays_d, means3D, opacity, ru, rv, normals, None, shs,
             alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling,
-            super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=True)
+            super_gaussian_order=sgo, first_hit_only=fho, return_hit_idx=True,
+            hit_buffer_size=self._trace_hit_buffer_size(sgo, fho))
         return hit_idx, alpha
 
     @torch.no_grad()
@@ -911,7 +934,8 @@ class GaussianModel:
         _, _, _, _, _, prefix_idx, prefix_w = self.gaussian_tracer.trace(
             rays_o, rays_d, means3D, opacity, ru, rv, normals, None, shs,
             alpha_min=self.alpha_min, deg=self.active_sh_degree, back_culling=back_culling,
-            super_gaussian_order=sgo, first_hit_only=False, return_prefix=True, n_prefix=n_prefix)
+            super_gaussian_order=sgo, first_hit_only=False, return_prefix=True, n_prefix=n_prefix,
+            hit_buffer_size=self._trace_hit_buffer_size(sgo, False))
         return prefix_idx, prefix_w
 
     def _split_sum_spec(self, n_j, rough_j, wi, f0=0.04):

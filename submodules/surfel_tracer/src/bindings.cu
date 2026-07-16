@@ -44,7 +44,7 @@ public:
         const torch::Tensor means3D, const torch::Tensor opacity, const torch::Tensor ru, const torch::Tensor rv, const torch::Tensor normals, const torch::Tensor features, const torch::Tensor shs, 
         torch::Tensor color, torch::Tensor normal, torch::Tensor feature, torch::Tensor depth, torch::Tensor alpha, torch::Tensor alpha_m2, torch::Tensor hit_idx, torch::Tensor prefix_idx, torch::Tensor prefix_w,
         const float alpha_min, const float transmittance_min, const int deg, const bool back_culling, const float super_gaussian_order,
-        const bool first_hit_only, torch::Tensor counters, const int n_prefix
+        const bool first_hit_only, torch::Tensor counters, const int n_prefix, const int hit_buffer_size
         ){
         const uint32_t n_elements = rays_o.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -64,7 +64,7 @@ public:
             n_elements, S, (const glm::vec3*)rays_o.data_ptr<float>(), (const glm::vec3*)rays_d.data_ptr<float>(), gs_idxs.data_ptr<int>(),
             (const glm::vec3*)means3D.data_ptr<float>(), opacity.data_ptr<float>(), (const glm::vec3*)ru.data_ptr<float>(), (const glm::vec3*)rv.data_ptr<float>(), (const glm::vec3*)normals.data_ptr<float>(), features.data_ptr<float>(), (const glm::vec3*)shs.data_ptr<float>(),
             (glm::vec3*)color.data_ptr<float>(), (glm::vec3*)normal.data_ptr<float>(), feature.data_ptr<float>(), depth.data_ptr<float>(), alpha.data_ptr<float>(), alpha_m2.data_ptr<float>(), hit_idx_ptr, prefix_idx_ptr, prefix_w_ptr,
-            alpha_min, transmittance_min, deg, max_coeffs, back_culling, super_gaussian_order, first_hit_only, counters_ptr, n_prefix, stream);
+            alpha_min, transmittance_min, deg, max_coeffs, back_culling, super_gaussian_order, first_hit_only, hit_buffer_size, counters_ptr, n_prefix, stream);
     }
     
     void intersection_test(
@@ -85,7 +85,7 @@ public:
         const torch::Tensor color, const torch::Tensor normal, const torch::Tensor feature, const torch::Tensor depth, const torch::Tensor alpha, const torch::Tensor alpha_m2,
         torch::Tensor grad_rays_o, torch::Tensor grad_rays_d, torch::Tensor grad_means3D, torch::Tensor grad_opacity, torch::Tensor grad_ru, torch::Tensor grad_rv, torch::Tensor grad_normals, torch::Tensor grad_features, torch::Tensor grad_shs,
         const torch::Tensor grad_out_color, const torch::Tensor grad_out_normal, const torch::Tensor grad_out_feature, const torch::Tensor grad_out_depth, const torch::Tensor grad_out_alpha, const torch::Tensor grad_out_alpha_m2,
-        const float alpha_min, const float transmittance_min, const int deg, const bool back_culling, const float super_gaussian_order
+        const float alpha_min, const float transmittance_min, const int deg, const bool back_culling, const float super_gaussian_order, const int hit_buffer_size
         ){
         const uint32_t n_elements = rays_o.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -99,7 +99,7 @@ public:
             (const glm::vec3*)color.data_ptr<float>(), (const glm::vec3*)normal.data_ptr<float>(), feature.data_ptr<float>(), depth.data_ptr<float>(), alpha.data_ptr<float>(), alpha_m2.data_ptr<float>(),
             (glm::vec3*)grad_rays_o.data_ptr<float>(), (glm::vec3*)grad_rays_d.data_ptr<float>(), (glm::vec3*)grad_means3D.data_ptr<float>(), grad_opacity.data_ptr<float>(), (glm::vec3*)grad_ru.data_ptr<float>(), (glm::vec3*)grad_rv.data_ptr<float>(), (glm::vec3*)grad_normals.data_ptr<float>(), grad_features.data_ptr<float>(), (glm::vec3*)grad_shs.data_ptr<float>(),
             (const glm::vec3*)grad_out_color.data_ptr<float>(), (const glm::vec3*)grad_out_normal.data_ptr<float>(), grad_out_feature.data_ptr<float>(), grad_out_depth.data_ptr<float>(), grad_out_alpha.data_ptr<float>(), grad_out_alpha_m2.data_ptr<float>(),
-            alpha_min, transmittance_min, deg, max_coeffs, back_culling, super_gaussian_order, stream);
+            alpha_min, transmittance_min, deg, max_coeffs, back_culling, super_gaussian_order, hit_buffer_size, stream);
     }
 
     std::shared_ptr<TriangleBvhBase> triangle_bvh;

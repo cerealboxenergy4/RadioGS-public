@@ -172,7 +172,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	float super_gaussian_order)                  // single-layer: SGO-aware tile cutoff
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -222,7 +223,10 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// the effective extent is now depended on the opacity of gaussian.
 	float cutoff = sqrtf(max(9.f + 2.f * logf(opacities[idx]), 0.000001));
 #else
-	float cutoff = 3.0f;
+	// trace-opt: SGO-aware cutoff keeping the stock 3-sigma truncation convention (cut at
+	// alpha = opacity*exp(-4.5)): solve 0.5*r^order == 4.5 -> r = 9^(1/order). Order 2 gives
+	// exactly 3.0 (bit-identical stock path); sharper footprints bin proportionally fewer tiles.
+	float cutoff = (super_gaussian_order == 2.0f) ? 3.0f : __powf(9.0f, 1.0f / super_gaussian_order);
 #endif
 
 	// Compute center and radius
@@ -525,7 +529,8 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* normal_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
-	bool prefiltered)
+	bool prefiltered,
+	float super_gaussian_order)
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
@@ -552,6 +557,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		normal_opacity,
 		grid,
 		tiles_touched,
-		prefiltered
+		prefiltered,
+		super_gaussian_order
 		);
 }

@@ -1,6 +1,7 @@
 import json
 import sys
 import os
+import time
 from gaussian_renderer import render_radiogs
 import numpy as np
 import torch
@@ -66,6 +67,7 @@ if __name__ == '__main__':
     # while the composite is ~0.98, which is why plain first_hit_only leaks energy.
     gaussians = RadioGSModel(3, transmittance_min=dataset.transmittance_min)
     gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
+    gaussians.hit_buffer_size = getattr(pipe, "hit_buffer_size", 0)  # trace-opt: 0 = auto K policy
     gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
     # single-layer: turn on trace-cost instrumentation (mean k_eff = accepted hits / ray).
     gaussians.gaussian_tracer.collect_counters = True
@@ -145,7 +147,9 @@ if __name__ == '__main__':
         psnr_pbr = 0.0
         ssim_pbr = 0.0
         lpips_pbr = 0.0
-        
+        render_times_ms = []   # single-layer: pure render-call ms per view (cuda events)
+        precompute_s = 0.0     # single-layer: one-time per-envmap precompute wall seconds
+
         capture_list = task_dict[task_name]["capture_list"]
         if not args.no_save:
             for capture_type in capture_list:
@@ -189,6 +193,7 @@ if __name__ == '__main__':
 
             # precompute indirect light for relighting with split-sum approach from IRGS
             if idx == start and True:
+                _t_pre = time.time()
                 with torch.no_grad():
                     dir_pp = gaussians.get_xyz - custom_cam.camera_center
                     dir_pp_normalized = dir_pp / (torch.norm(dir_pp, dim=-1, keepdim=True) + 1e-6)
@@ -237,9 +242,18 @@ if __name__ == '__main__':
                         from gaussian_renderer.radiogs import build_eval_shading_cache
                         build_eval_shading_cache(gaussians, pipe,
                                                  base_color=gaussians.get_base_color * base_color_scale)
+                torch.cuda.synchronize()
+                precompute_s = time.time() - _t_pre
 
+            # single-layer: pure per-view relight render time (cuda events; excludes GT I/O,
+            # image saving and PSNR/SSIM/LPIPS below — the paper's "relight time/view" number).
+            ev_start = torch.cuda.Event(enable_timing=True); ev_end = torch.cuda.Event(enable_timing=True)
             with torch.no_grad():
+                ev_start.record()
                 render_pkg = render_radiogs(viewpoint_camera=custom_cam, **render_kwargs)
+                ev_end.record()
+            torch.cuda.synchronize()
+            render_times_ms.append(ev_start.elapsed_time(ev_end))
 
             render_pkg["render"] = render_pkg["render"] * mask + (1 - mask) * bg
             gt_image_env = gt_image + render_pkg["env_only"] * (1 - mask)
@@ -272,6 +286,9 @@ if __name__ == '__main__':
         results_dict[task_name]["psnr_pbr"] = psnr_pbr
         results_dict[task_name]["ssim_pbr"] = ssim_pbr
         results_dict[task_name]["lpips_pbr"] = lpips_pbr
+        # single-layer: pure relight render time/view + one-time per-envmap precompute cost.
+        results_dict[task_name]["render_time_ms_per_view"] = float(np.mean(render_times_ms)) if render_times_ms else None
+        results_dict[task_name]["precompute_s"] = float(precompute_s)
 
         print("\nEvaluating {}: PSNR_PBR {: .4f} SSIM_PBR {: .4f} LPIPS_PBR {: .4f}".format(task_name, psnr_pbr, ssim_pbr, lpips_pbr))
 
@@ -279,6 +296,12 @@ if __name__ == '__main__':
     results_dict["psnr_pbr_avg"] = np.mean([results_dict[task_name]["psnr_pbr"] for task_name in task_names])
     results_dict["ssim_pbr_avg"] = np.mean([results_dict[task_name]["ssim_pbr"] for task_name in task_names])
     results_dict["lpips_pbr_avg"] = np.mean([results_dict[task_name]["lpips_pbr"] for task_name in task_names])
+    results_dict["render_time_ms_per_view_avg"] = float(np.mean(
+        [results_dict[t]["render_time_ms_per_view"] for t in task_names
+         if results_dict[t]["render_time_ms_per_view"] is not None] or [np.nan]))
+    results_dict["precompute_s_avg"] = float(np.mean([results_dict[t]["precompute_s"] for t in task_names]))
+    print("[relight-time] render {:.1f} ms/view  precompute {:.1f} s/envmap".format(
+          results_dict["render_time_ms_per_view_avg"], results_dict["precompute_s_avg"]))
     print("\nEvaluating AVG: PSNR_PBR {: .4f} SSIM_PBR {: .4f} LPIPS_PBR {: .4f}".format(results_dict["psnr_pbr_avg"], results_dict["ssim_pbr_avg"], results_dict["lpips_pbr_avg"]))
     # single-layer: report trace-cost spine (the Part-2 cost axis / north-star number).
     cand_per_ray, keff, n_rays = gaussians.gaussian_tracer.read_counters()

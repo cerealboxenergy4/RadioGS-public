@@ -45,6 +45,7 @@ struct Gaussiantrace_backward {
 		int S;
 		bool back_culling;
 		float super_gaussian_order;
+		int hit_buffer_size;              // trace-opt: active K-nearest gather size (must match forward)
 		OptixTraversableHandle handle;
 	};
 

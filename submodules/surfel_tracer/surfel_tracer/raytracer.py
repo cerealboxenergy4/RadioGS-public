@@ -4,7 +4,7 @@ from surfel_tracer import _C
 
 class _GaussianTrace(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, bvh, rays_o, rays_d, gs_idxs, means3D, opacity, ru, rv, normals, features, shs, alpha_min, transmittance_min, deg, back_culling, super_gaussian_order, first_hit_only, counters, n_prefix):
+    def forward(ctx, bvh, rays_o, rays_d, gs_idxs, means3D, opacity, ru, rv, normals, features, shs, alpha_min, transmittance_min, deg, back_culling, super_gaussian_order, first_hit_only, counters, n_prefix, hit_buffer_size):
         color = torch.zeros_like(rays_o)
         normal = torch.zeros_like(rays_o)
         feature = torch.zeros(*rays_o.shape[:-1], features.shape[-1], device=rays_o.device, dtype=rays_o.dtype)
@@ -25,7 +25,7 @@ class _GaussianTrace(torch.autograd.Function):
             rays_o, rays_d, gs_idxs, means3D, opacity, ru, rv, normals, features, shs,
             color, normal, feature, depth, alpha, alpha_m2, hit_idx, prefix_idx, prefix_w,
             alpha_min, transmittance_min, deg, back_culling, super_gaussian_order,
-            first_hit_only, counters, K
+            first_hit_only, counters, K, hit_buffer_size
         )
 
         ctx.alpha_min = alpha_min
@@ -34,6 +34,7 @@ class _GaussianTrace(torch.autograd.Function):
         ctx.bvh = bvh
         ctx.back_culling = back_culling
         ctx.super_gaussian_order = super_gaussian_order
+        ctx.hit_buffer_size = hit_buffer_size  # trace-opt: backward must replay with the same K
         ctx.save_for_backward(rays_o, rays_d, gs_idxs, means3D, opacity, ru, rv, normals, features, shs, color, normal, feature, depth, alpha, alpha_m2)
         return color, normal, feature, depth, alpha, alpha_m2, hit_idx, prefix_idx, prefix_w
 
@@ -55,7 +56,7 @@ class _GaussianTrace(torch.autograd.Function):
             color, normal, feature, depth, alpha, alpha_m2,
             grad_rays_o, grad_rays_d, grad_means3D, grad_opacity, grad_ru, grad_rv, grad_normals, grad_features, grad_shs,
             grad_out_color, grad_out_normal, grad_out_feature, grad_out_depth, grad_out_alpha, grad_out_alpha_m2.contiguous(),
-            ctx.alpha_min, ctx.transmittance_min, ctx.deg, ctx.back_culling, ctx.super_gaussian_order
+            ctx.alpha_min, ctx.transmittance_min, ctx.deg, ctx.back_culling, ctx.super_gaussian_order, ctx.hit_buffer_size
         )
         
         grads = (
@@ -78,6 +79,7 @@ class _GaussianTrace(torch.autograd.Function):
             None,  # first_hit_only
             None,  # counters
             None,  # n_prefix
+            None,  # hit_buffer_size
         )
 
         return grads
@@ -114,7 +116,7 @@ class GaussianTracer():
         self.gs_idxs = gs_idxs.int()
         self.impl.update_bvh(vertices_b[faces_b])
 
-    def trace(self, rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min, deg=3, back_culling=False, super_gaussian_order=2.0, first_hit_only=False, return_alpha_m2=False, return_hit_idx=False, return_prefix=False, n_prefix=8):
+    def trace(self, rays_o, rays_d, means3D, opacity, ru, rv, normals, features, shs, alpha_min, deg=3, back_culling=False, super_gaussian_order=2.0, first_hit_only=False, return_alpha_m2=False, return_hit_idx=False, return_prefix=False, n_prefix=8, hit_buffer_size=16):
         rays_o = rays_o.contiguous()
         rays_d = rays_d.contiguous()
         means3D = means3D.contiguous()
@@ -133,30 +135,29 @@ class GaussianTracer():
         rays_d = rays_d.view(-1, 3)
 
         B = rays_o.shape[0]
-        mask = torch.zeros(B, dtype=torch.bool, device='cuda')
-        self.impl.intersection_test(rays_o, rays_d, self.gs_idxs, means3D, opacity, ru, rv, normals, mask)
-        color = torch.zeros(B, 3, dtype=torch.float32, device='cuda')
-        normal = torch.zeros(B, 3, dtype=torch.float32, device='cuda')
-        feature = torch.zeros(B, features.shape[-1], dtype=torch.float32, device='cuda')
-        depth = torch.zeros(B, dtype=torch.float32, device='cuda')
-        alpha = torch.zeros(B, dtype=torch.float32, device='cuda')
-        alpha_m2 = torch.zeros(B, dtype=torch.float32, device='cuda')  # single-layer: Sum w_i^2
-        hit_idx = torch.full((B,), -1, dtype=torch.int32, device='cuda')  # radiosity: first-hit gs_idx (-1 = miss)
-        # virtual-surfel: per-ray significant-hit prefix buffers (K=0 -> disabled -> kernel gets nullptr)
+        # trace-opt: the intersection_test pre-pass is gone — the main trace handles misses directly
+        # (empty first buffer round -> zero outputs), so all rays launch once instead of visiting the
+        # BVH twice plus a mask gather/scatter over every output tensor. The k_eff counter denominator
+        # keeps the old "rays that hit the BVH" semantics inside the kernel (kcand > 0 gate).
         K = int(n_prefix) if return_prefix and n_prefix and n_prefix > 0 else 0
-        prefix_idx = torch.full((B, K), -1, dtype=torch.int32, device='cuda')
-        prefix_w = torch.zeros((B, K), dtype=torch.float32, device='cuda')
-
-        rays_o_ = rays_o[mask]
-        rays_d_ = rays_d[mask]
         # single-layer: counter buffer for k_eff / candidate instrumentation (None -> disabled)
         counters = None
         if self.collect_counters:
             if self.counter_accum is None:
                 self.reset_counters()
             counters = self.counter_accum
-        if not rays_o_.shape[0] == 0:
-            color[mask], normal[mask], feature[mask], depth[mask], alpha[mask], alpha_m2[mask], hit_idx[mask], prefix_idx[mask], prefix_w[mask] = _GaussianTrace.apply(self.impl, rays_o_, rays_d_, self.gs_idxs, means3D, opacity, ru, rv, normals, features, shs, alpha_min, self.transmittance_min, deg, back_culling, super_gaussian_order, first_hit_only, counters, K)
+        if B > 0:
+            color, normal, feature, depth, alpha, alpha_m2, hit_idx, prefix_idx, prefix_w = _GaussianTrace.apply(self.impl, rays_o, rays_d, self.gs_idxs, means3D, opacity, ru, rv, normals, features, shs, alpha_min, self.transmittance_min, deg, back_culling, super_gaussian_order, first_hit_only, counters, K, int(hit_buffer_size))
+        else:
+            color = torch.zeros(B, 3, dtype=torch.float32, device='cuda')
+            normal = torch.zeros(B, 3, dtype=torch.float32, device='cuda')
+            feature = torch.zeros(B, features.shape[-1], dtype=torch.float32, device='cuda')
+            depth = torch.zeros(B, dtype=torch.float32, device='cuda')
+            alpha = torch.zeros(B, dtype=torch.float32, device='cuda')
+            alpha_m2 = torch.zeros(B, dtype=torch.float32, device='cuda')
+            hit_idx = torch.full((B,), -1, dtype=torch.int32, device='cuda')
+            prefix_idx = torch.full((B, K), -1, dtype=torch.int32, device='cuda')
+            prefix_w = torch.zeros((B, K), dtype=torch.float32, device='cuda')
 
         color = color.view(*prefix, 3)
         normal = normal.view(*prefix, 3)

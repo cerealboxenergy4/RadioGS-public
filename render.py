@@ -261,6 +261,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     with torch.no_grad():
         gaussians = RadioGSModel(dataset.sh_degree)
         gaussians.super_gaussian_order = getattr(pipeline, "super_gaussian_order", 2.0)  # single-layer ironing
+        gaussians.hit_buffer_size = getattr(pipeline, "hit_buffer_size", 0)  # trace-opt: 0 = auto K policy
         gaussians.first_hit_only = getattr(pipeline, "first_hit_only", False)  # single-layer: first-hit trace mode
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.build_bvh()      

@@ -29,14 +29,19 @@ extern "C" __global__ void __raygen__rg() {
 	// virtual-surfel: count of prefix entries written so far for this ray (capped at params.n_prefix).
 	int nprefix = 0;
 
+	// trace-opt: active gather size for this launch (runtime-bounded loops over the fixed-size
+	// array). K < MAX_BUFFER_SIZE makes the anyhit commit hits sooner (tmax shrinks once the
+	// small buffer fills), so OptiX culls BVH subtrees beyond the K nearest candidates.
+	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+
 	HitInfo hitArray[MAX_BUFFER_SIZE];
 	unsigned int hitArrayPtr0 = (unsigned int)((uintptr_t)(&hitArray) & 0xFFFFFFFF);
     unsigned int hitArrayPtr1 = (unsigned int)(((uintptr_t)(&hitArray) >> 32) & 0xFFFFFFFF);
 
 	while ((t_start < T_SCENE_MAX) && (T > params.transmittance_min)){
 		ray_origin = ray_o + t_start * ray_d;
-		
-		for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+
+		for (int i = 0; i < K; ++i) {
 			hitArray[i].t = 1e16f;
 			hitArray[i].primIdx = -1;
 		}
@@ -56,7 +61,7 @@ extern "C" __global__ void __raygen__rg() {
 			hitArrayPtr1
 		);
 
-		for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+		for (int i = 0; i < K; ++i) {
 			int primIdx = hitArray[i].primIdx;
 
 			if (primIdx == -1) {
@@ -161,10 +166,13 @@ extern "C" __global__ void __raygen__rg() {
 
 	// single-layer: accumulate global trace-cost counters (candidates, accepted hits = k_eff).
 	// Optional: only when a counter buffer was provided (eval-time measurement, off in training).
-	if (params.counters != nullptr){
+	// trace-opt: the intersection_test pre-pass is gone, so all rays launch; count a ray in the
+	// denominator only if it buffered >=1 candidate — exactly the set the pre-pass used to pass
+	// (same BVH, same geometry), keeping k_eff comparable across runs.
+	if (params.counters != nullptr && kcand > 0){
 		atomicAdd(params.counters + 0, (unsigned long long)kcand);
 		atomicAdd(params.counters + 1, (unsigned long long)khit);
-		atomicAdd(params.counters + 2, (unsigned long long)1);  // ray count (rays that ran)
+		atomicAdd(params.counters + 2, (unsigned long long)1);  // ray count (rays that hit the BVH)
 	}
 }
 
@@ -177,11 +185,14 @@ extern "C" __global__ void __closesthit__ch() {
 extern "C" __global__ void __anyhit__ah() {
     HitInfo* hitArray = (HitInfo*)((uintptr_t)optixGetPayload_0() | ((uintptr_t)optixGetPayload_1() << 32));
 
+	// trace-opt: runtime-bounded K-nearest insertion (params is visible from the anyhit program).
+	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+
 	float THit = optixGetRayTmax();
     int i_prim = optixGetPrimitiveIndex();
 	HitInfo newHit = {THit, i_prim};
 
-	for (int i = 0; i < MAX_BUFFER_SIZE; ++i) {
+	for (int i = 0; i < K; ++i) {
 		if (hitArray[i].primIdx == -1){
 			hitArray[i] = newHit;
 			break;
@@ -191,8 +202,8 @@ extern "C" __global__ void __anyhit__ah() {
         }
     }
 
-	if (THit < hitArray[MAX_BUFFER_SIZE - 1].t) {
-        optixIgnoreIntersection(); 
+	if (THit < hitArray[K - 1].t) {
+        optixIgnoreIntersection();
     }
 
 }

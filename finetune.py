@@ -73,6 +73,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     gaussians = RadioGSModel(dataset.sh_degree)
     gaussians.super_gaussian_order = getattr(pipe, "super_gaussian_order", 2.0)  # single-layer ironing
+    gaussians.hit_buffer_size = getattr(pipe, "hit_buffer_size", 0)  # trace-opt: 0 = auto K policy
     gaussians.first_hit_only = getattr(pipe, "first_hit_only", False)  # single-layer: first-hit trace mode
     # set_gaussian_para(gaussians, opt)
     
