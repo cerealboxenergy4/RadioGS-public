@@ -8,6 +8,16 @@
 
 #include <glm/glm.hpp>
 #define MAX_BUFFER_SIZE 16
+// trace-opt: compile-time K-nearest hit-buffer size. The forward/backward OptiX programs are
+// compiled into K=1/4/16 PTX variants (gaussiantrace_{forward,backward}[_k{1,4}].cu); the host
+// snaps the requested hit_buffer_size to the nearest variant. Compile-time K shrinks the
+// per-ray local hit array (16 -> K entries, so the local-memory depot and init/insertion work
+// scale with K) and lets the insertion loop fully unroll; small K also commits tmax as soon as
+// the buffer fills, so traversal culls BVH subtrees beyond the K nearest candidates. Exact for
+// any K because the outer relaunch loop resumes past the K-th hit.
+#ifndef HIT_BUFFER_K
+#define HIT_BUFFER_K MAX_BUFFER_SIZE
+#endif
 #define T_SCENE_MAX 100.0f
 #define MAX_FEATURE_SIZE 12
 

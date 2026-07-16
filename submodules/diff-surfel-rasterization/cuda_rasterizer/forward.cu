@@ -223,10 +223,19 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	// the effective extent is now depended on the opacity of gaussian.
 	float cutoff = sqrtf(max(9.f + 2.f * logf(opacities[idx]), 0.000001));
 #else
-	// trace-opt: SGO-aware cutoff keeping the stock 3-sigma truncation convention (cut at
-	// alpha = opacity*exp(-4.5)): solve 0.5*r^order == 4.5 -> r = 9^(1/order). Order 2 gives
-	// exactly 3.0 (bit-identical stock path); sharper footprints bin proportionally fewer tiles.
-	float cutoff = (super_gaussian_order == 2.0f) ? 3.0f : __powf(9.0f, 1.0f / super_gaussian_order);
+	// trace-opt: SGO-aware cutoff. Order 2 keeps the stock fixed 3-sigma cutoff (bit-identical
+	// stock path). Order > 2 uses the EXACT support of the render kernel's alpha >= 1/255
+	// acceptance: solve o*exp(-0.5*r^order) = 1/255 -> r = (2*ln(255*o))^(1/order), so nothing
+	// the kernel would composite is ever cut (the speedup is a pure bound tightening, not an
+	// approximation). o <= 1/255 can never contribute -> skip (radii/tiles_touched stay 0).
+	float cutoff;
+	if (super_gaussian_order == 2.0f) {
+		cutoff = 3.0f;
+	} else {
+		float t = 2.0f * logf(255.0f * opacities[idx]);
+		if (t <= 0.0f) return;
+		cutoff = __powf(t, 1.0f / super_gaussian_order);
+	}
 #endif
 
 	// Compute center and radius

@@ -29,12 +29,10 @@ extern "C" __global__ void __raygen__rg() {
 	// virtual-surfel: count of prefix entries written so far for this ray (capped at params.n_prefix).
 	int nprefix = 0;
 
-	// trace-opt: active gather size for this launch (runtime-bounded loops over the fixed-size
-	// array). K < MAX_BUFFER_SIZE makes the anyhit commit hits sooner (tmax shrinks once the
-	// small buffer fills), so OptiX culls BVH subtrees beyond the K nearest candidates.
-	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+	// trace-opt: compile-time gather size (this TU is one of the K=1/4/16 PTX variants).
+	constexpr int K = HIT_BUFFER_K;
 
-	HitInfo hitArray[MAX_BUFFER_SIZE];
+	HitInfo hitArray[HIT_BUFFER_K];
 	unsigned int hitArrayPtr0 = (unsigned int)((uintptr_t)(&hitArray) & 0xFFFFFFFF);
     unsigned int hitArrayPtr1 = (unsigned int)(((uintptr_t)(&hitArray) >> 32) & 0xFFFFFFFF);
 
@@ -185,8 +183,8 @@ extern "C" __global__ void __closesthit__ch() {
 extern "C" __global__ void __anyhit__ah() {
     HitInfo* hitArray = (HitInfo*)((uintptr_t)optixGetPayload_0() | ((uintptr_t)optixGetPayload_1() << 32));
 
-	// trace-opt: runtime-bounded K-nearest insertion (params is visible from the anyhit program).
-	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+	// trace-opt: compile-time K-nearest insertion (fully unrolled at K=1/4/16).
+	constexpr int K = HIT_BUFFER_K;
 
 	float THit = optixGetRayTmax();
     int i_prim = optixGetPrimitiveIndex();

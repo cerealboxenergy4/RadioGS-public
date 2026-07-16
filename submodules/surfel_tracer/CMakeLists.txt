@@ -73,7 +73,11 @@ set(CUDA_INCLUDE "${CUDA_DIR}/include")
 
 add_library(optix_program OBJECT
 	src/optix/gaussiantrace_forward.cu
+	src/optix/gaussiantrace_forward_k1.cu
+	src/optix/gaussiantrace_forward_k4.cu
 	src/optix/gaussiantrace_backward.cu
+	src/optix/gaussiantrace_backward_k1.cu
+	src/optix/gaussiantrace_backward_k4.cu
 	src/optix/gaussiantrace_intersection_test.cu
 )
 

@@ -33,11 +33,11 @@ extern "C" __global__ void __raygen__rg() {
 
 	float T = 1.0f, t_start = 0.0f, t_curr = 0.0f;
 
-	// trace-opt: active gather size (runtime-bounded loops; must match the forward pass so the
-	// compositing replay visits hits in the identical order).
-	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+	// trace-opt: compile-time gather size (K=1/4/16 PTX variants; the host selects the SAME
+	// variant as the forward pass so the compositing replay visits hits in identical order).
+	constexpr int K = HIT_BUFFER_K;
 
-	HitInfo hitArray[MAX_BUFFER_SIZE];
+	HitInfo hitArray[HIT_BUFFER_K];
 	unsigned int hitArrayPtr0 = (unsigned int)((uintptr_t)(&hitArray) & 0xFFFFFFFF);
     unsigned int hitArrayPtr1 = (unsigned int)(((uintptr_t)(&hitArray) >> 32) & 0xFFFFFFFF);
 
@@ -193,8 +193,8 @@ extern "C" __global__ void __closesthit__ch() {
 extern "C" __global__ void __anyhit__ah() {
     HitInfo* hitArray = (HitInfo*)((uintptr_t)optixGetPayload_0() | ((uintptr_t)optixGetPayload_1() << 32));
 
-	// trace-opt: runtime-bounded K-nearest insertion (params is visible from the anyhit program).
-	const int K = min(max(params.hit_buffer_size, 1), MAX_BUFFER_SIZE);
+	// trace-opt: compile-time K-nearest insertion (fully unrolled at K=1/4/16).
+	constexpr int K = HIT_BUFFER_K;
 
 	float THit = optixGetRayTmax();
     int i_prim = optixGetPrimitiveIndex();

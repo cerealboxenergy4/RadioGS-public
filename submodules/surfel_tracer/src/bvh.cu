@@ -165,10 +165,19 @@ public:
 	TriangleBvh(){
 		m_optix.available = optix::initialize();
 		m_optix.gaussiantrace_forward = std::make_unique<optix::Program<Gaussiantrace_forward>>((const char*)optix_ptx::gaussiantrace_forward_ptx, sizeof(optix_ptx::gaussiantrace_forward_ptx), g_optix);
+		// trace-opt: small-K PTX variants of the same programs (K=1/4; the default build is K=16).
+		m_optix.gaussiantrace_forward_k1 = std::make_unique<optix::Program<Gaussiantrace_forward>>((const char*)optix_ptx::gaussiantrace_forward_k1_ptx, sizeof(optix_ptx::gaussiantrace_forward_k1_ptx), g_optix);
+		m_optix.gaussiantrace_forward_k4 = std::make_unique<optix::Program<Gaussiantrace_forward>>((const char*)optix_ptx::gaussiantrace_forward_k4_ptx, sizeof(optix_ptx::gaussiantrace_forward_k4_ptx), g_optix);
 		m_optix.gaussiantrace_backward = std::make_unique<optix::Program<Gaussiantrace_backward>>((const char*)optix_ptx::gaussiantrace_backward_ptx, sizeof(optix_ptx::gaussiantrace_backward_ptx), g_optix);
+		m_optix.gaussiantrace_backward_k1 = std::make_unique<optix::Program<Gaussiantrace_backward>>((const char*)optix_ptx::gaussiantrace_backward_k1_ptx, sizeof(optix_ptx::gaussiantrace_backward_k1_ptx), g_optix);
+		m_optix.gaussiantrace_backward_k4 = std::make_unique<optix::Program<Gaussiantrace_backward>>((const char*)optix_ptx::gaussiantrace_backward_k4_ptx, sizeof(optix_ptx::gaussiantrace_backward_k4_ptx), g_optix);
 		m_optix.gaussiantrace_intersection_test = std::make_unique<optix::Program<Gaussiantrace_intersection_test>>((const char*)optix_ptx::gaussiantrace_intersection_test_ptx, sizeof(optix_ptx::gaussiantrace_intersection_test_ptx), g_optix);
 		// printf("Build OptiX shaders success.\n");
 	}
+
+	// trace-opt: snap the requested hit-buffer size to the nearest compiled variant (up, so the
+	// gather is never smaller than requested; every K is exact, this only affects speed).
+	static int snap_hit_buffer_k(int k) { return (k <= 1) ? 1 : ((k <= 4) ? 4 : MAX_BUFFER_SIZE); }
 
 	~TriangleBvh() {
 		if (m_optix.available) {
@@ -196,7 +205,9 @@ public:
 		glm::vec3* color, glm::vec3* normal, float* feature, float* depth, float* alpha, float* alpha_m2, int* hit_idx, int* prefix_idx, float* prefix_w,
 		const float alpha_min, const float transmittance_min, const int deg, const int max_coeffs, const bool back_culling, const float super_gaussian_order, const bool first_hit_only, const int hit_buffer_size, unsigned long long* counters, const int n_prefix, cudaStream_t stream
 	) override {
-        m_optix.gaussiantrace_forward->invoke(
+		const int K = snap_hit_buffer_k(hit_buffer_size);
+		auto& fwd = (K == 1) ? m_optix.gaussiantrace_forward_k1 : (K == 4) ? m_optix.gaussiantrace_forward_k4 : m_optix.gaussiantrace_forward;
+        fwd->invoke(
 			{
 				rays_o, rays_d, gs_idxs,
 				means3D, opacity, ru, rv, normals, features, shs,
@@ -215,7 +226,9 @@ public:
         const glm::vec3* grad_color, const glm::vec3* grad_normal, const float* grad_feature, const float* grad_depth, const float* grad_alpha, const float* grad_alpha_m2,
 		const float alpha_min, const float transmittance_min, const int deg, const int max_coeffs, const bool back_culling, const float super_gaussian_order, const int hit_buffer_size, cudaStream_t stream
 	) override {
-        m_optix.gaussiantrace_backward->invoke(
+		const int K = snap_hit_buffer_k(hit_buffer_size);
+		auto& bwd = (K == 1) ? m_optix.gaussiantrace_backward_k1 : (K == 4) ? m_optix.gaussiantrace_backward_k4 : m_optix.gaussiantrace_backward;
+        bwd->invoke(
 			{
 				rays_o, rays_d, gs_idxs,
 				means3D, opacity, ru, rv, normals, features, shs,
@@ -240,8 +253,12 @@ public:
 private:
     struct {
         std::unique_ptr<optix::Gas> gas;
-        std::unique_ptr<optix::Program<Gaussiantrace_forward>> gaussiantrace_forward;
-        std::unique_ptr<optix::Program<Gaussiantrace_backward>> gaussiantrace_backward;
+        std::unique_ptr<optix::Program<Gaussiantrace_forward>> gaussiantrace_forward;      // K=16
+        std::unique_ptr<optix::Program<Gaussiantrace_forward>> gaussiantrace_forward_k1;   // trace-opt
+        std::unique_ptr<optix::Program<Gaussiantrace_forward>> gaussiantrace_forward_k4;   // trace-opt
+        std::unique_ptr<optix::Program<Gaussiantrace_backward>> gaussiantrace_backward;    // K=16
+        std::unique_ptr<optix::Program<Gaussiantrace_backward>> gaussiantrace_backward_k1; // trace-opt
+        std::unique_ptr<optix::Program<Gaussiantrace_backward>> gaussiantrace_backward_k4; // trace-opt
         std::unique_ptr<optix::Program<Gaussiantrace_intersection_test>> gaussiantrace_intersection_test;
         bool available = false;
     } m_optix;
