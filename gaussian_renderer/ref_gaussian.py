@@ -20,6 +20,15 @@ from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 from utils.refl_utils import  get_specular_color_surfel, get_full_color_volume, get_full_color_volume_indirect, get_specular_color_surfel2
 from utils.graphics_utils import rgb_to_srgb, srgb_to_rgb
+
+
+def _counterfactual_first_hit(allmap, bg_color, srgb=False):
+    """Reconstruct a first-accepted-surfel-only image from forward-only raster channels."""
+    alpha = allmap[8:9]
+    premultiplied_rgb = allmap[9:12]
+    if srgb:
+        premultiplied_rgb = rgb_to_srgb(premultiplied_rgb)
+    return premultiplied_rgb + bg_color[:, None, None] * (1 - alpha)
 import numpy as np
 
 def load_rasterizer(pipe, 
@@ -220,6 +229,10 @@ def render_initial(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
         "radii": radii,
         'rend_alpha': render_alpha,
         'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+        'rend_first_alpha': allmap[8:9],  # detached first-touch strength for gate diagnostics
+        'rend_first_hit': _counterfactual_first_hit(allmap, bg_color, srgb),
+        'rend_first_depth': allmap[12:13],
+        'rend_depth_expected': render_depth_expected,
         'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
         'rend_normal': render_normal,
         'rend_dist': render_dist,
@@ -348,6 +361,7 @@ def render_surfel(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
     # 2DGS normal and regularizations
     regularizations = compute_2dgs_normal_and_regularizations(allmap, viewpoint_camera, pipe)
     render_alpha = regularizations['render_alpha']
+    render_depth_expected = regularizations['render_depth_expected']
     render_normal = regularizations['render_normal']
     render_dist = regularizations['render_dist']
     surf_depth = regularizations['surf_depth']
@@ -416,6 +430,10 @@ def render_surfel(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
             "radii": radii,
             'rend_alpha': render_alpha,
             'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+            'rend_first_alpha': allmap[8:9],  # detached first-touch strength for gate diagnostics
+            'rend_first_hit': _counterfactual_first_hit(allmap, bg_color, srgb),
+            'rend_first_depth': allmap[12:13],
+            'rend_depth_expected': render_depth_expected,
             'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
             'rend_normal': render_normal,
             'rend_dist': render_dist,
@@ -543,6 +561,7 @@ def render_surfel2(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
     # 2DGS normal and regularizations
     regularizations = compute_2dgs_normal_and_regularizations(allmap, viewpoint_camera, pipe)
     render_alpha = regularizations['render_alpha']
+    render_depth_expected = regularizations['render_depth_expected']
     render_normal = regularizations['render_normal']
     render_dist = regularizations['render_dist']
     surf_depth = regularizations['surf_depth']
@@ -576,6 +595,10 @@ def render_surfel2(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : tor
         "radii": radii,
         'rend_alpha': render_alpha,
         'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+        'rend_first_alpha': allmap[8:9],  # detached first-touch strength for gate diagnostics
+        'rend_first_hit': _counterfactual_first_hit(allmap, bg_color, srgb),
+        'rend_first_depth': allmap[12:13],
+        'rend_depth_expected': render_depth_expected,
         'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
         'rend_normal': render_normal,
         'rend_dist': render_dist,
@@ -749,6 +772,7 @@ def render_volume(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
     # 2DGS normal and regularizations
     regularizations = compute_2dgs_normal_and_regularizations(allmap, viewpoint_camera, pipe)
     render_alpha = regularizations['render_alpha']
+    render_depth_expected = regularizations['render_depth_expected']
     render_normal = regularizations['render_normal']
     render_dist = regularizations['render_dist']
     surf_depth = regularizations['surf_depth']
@@ -805,6 +829,10 @@ def render_volume(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color : torc
             "radii": radii,
             'rend_alpha': render_alpha,
             'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+            'rend_first_alpha': allmap[8:9],  # detached first-touch strength for gate diagnostics
+            'rend_first_hit': _counterfactual_first_hit(allmap, bg_color, srgb),
+            'rend_first_depth': allmap[12:13],
+            'rend_depth_expected': render_depth_expected,
             'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
             'rend_normal': render_normal,
             'rend_dist': render_dist,
@@ -974,6 +1002,7 @@ def render_volume_test(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color :
     # 2DGS normal and regularizations
     regularizations = compute_2dgs_normal_and_regularizations(allmap, viewpoint_camera, pipe)
     render_alpha = regularizations['render_alpha']
+    render_depth_expected = regularizations['render_depth_expected']
     render_normal = regularizations['render_normal']
     render_dist = regularizations['render_dist']
     surf_depth = regularizations['surf_depth']
@@ -1054,6 +1083,10 @@ def render_volume_test(viewpoint_camera, pc : RefGaussianModel, pipe, bg_color :
             ## normal, accum alpha, dist, depth map
             'rend_alpha': render_alpha,
             'rend_alpha_m2': allmap[7:8],  # single-layer: sum w_i^2 -> N_eff
+            'rend_first_alpha': allmap[8:9],  # detached first-touch strength for gate diagnostics
+            'rend_first_hit': _counterfactual_first_hit(allmap, bg_color, srgb),
+            'rend_first_depth': allmap[12:13],
+            'rend_depth_expected': render_depth_expected,
             'surfel_contrib': surfel_contrib,  # single-layer: per-Gaussian max contribution
             'rend_normal': render_normal,
             'rend_dist': render_dist,

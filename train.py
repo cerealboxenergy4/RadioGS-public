@@ -12,7 +12,10 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import calculate_loss2, calculate_loss3, keff_loss, alpha_binary_loss, scheduled_weight
+from utils.loss_utils import (calculate_loss2, calculate_loss3, keff_loss, alpha_binary_loss,
+                             scheduled_weight, gradient_dissent_gate,
+                             gradient_dissent_soft_gate,
+                             material_gradient_dissent_observation)
 from gaussian_renderer import render_radiogs
 import sys
 from scene import Scene, RadioGSModel
@@ -224,7 +227,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
         
         total_loss, tb_dict = calculate_loss3(viewpoint_cam, gaussians, render_pkg, opt, iteration)
+        # calculate_loss3 keeps this differentiable private entry so the response
+        # term can be routed separately.  Never pass it to TensorBoard below.
+        response_align_contrib = tb_dict.pop("_response_align_contrib", None)
         dist_loss, normal_loss, loss = tb_dict["loss_dist"], tb_dict["loss_normal_render_depth"], tb_dict["loss"]
+
+        if iteration == max(first_iter, opt.response_align_warmup_iters + 1) and (
+            opt.lambda_response_align_albedo > 0.0 or opt.lambda_response_align_roughness > 0.0
+            or opt.lambda_response_align_normal > 0.0
+        ):
+            print(
+                "[response-align] "
+                f"D_a={float(tb_dict['loss_response_align_albedo']):.6f} "
+                f"D_r={float(tb_dict['loss_response_align_roughness']):.6f} "
+                f"D_n={float(tb_dict['loss_response_align_normal']):.6f} "
+                f"mask={float(tb_dict['response_align_mask_frac']):.4f} "
+                f"N_eff={float(tb_dict['response_align_neff']):.3f}"
+            )
 
         # ---- single-layer trace-ray losses: k_eff (layer count) and alpha-binary (opacity
         # binarization). Both consume the same sampled ray batch and trace; either lambda alone
@@ -249,7 +268,102 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_dict["alpha_hit_mean"] = float(alpha_hit_mean)
                 tb_dict["alpha_hit_frac"] = float(ab_hit)
 
-        total_loss.backward()
+        # ---- Stage-2 material-gradient dissent ---------------------------------
+        # Response alignment is evaluated per camera ray, but its gradient is
+        # routed per surfel.  First backpropagate the reconstruction objective,
+        # then use its row gradients to identify surfels for which albedo /
+        # roughness / normal consensus persistently opposes reconstruction.
+        # Protected surfels receive a reduced *alignment* gradient only; the
+        # data/PBR reconstruction gradient is never gated.
+        material_dissent = bool(getattr(opt, "material_dissent_alignment", False))
+        if material_dissent and response_align_contrib is not None:
+            # Attribute rows receive selective alignment.  The response moments
+            # also depend on blend weights; retain those small Stage-2 geometry
+            # gradients unchanged so this mode differs only in material routing.
+            material_params = (gaussians._base_color, gaussians._roughness, gaussians._rotation)
+            response_params = material_params + (gaussians._xyz, gaussians._opacity, gaussians._scaling)
+            alignment_grads = torch.autograd.grad(
+                response_align_contrib, response_params, retain_graph=True, allow_unused=True
+            )
+            data_loss = total_loss - response_align_contrib
+            data_loss.backward()
+
+            gaussians.ensure_material_dissent_stats()
+            visible = render_pkg["visibility_filter"]
+            collect = iteration >= int(getattr(opt, "material_dissent_collect_from_iter", 0))
+            apply_gate = collect and iteration >= int(getattr(opt, "material_dissent_gate_from_iter", 0))
+            gate = torch.ones(gaussians.get_xyz.shape[0], device=gaussians.get_xyz.device)
+            protected = torch.zeros_like(gate, dtype=torch.bool)
+            if apply_gate:
+                if opt.material_dissent_gate_mode == "topk":
+                    gate, protected = gradient_dissent_gate(
+                        gaussians.material_dissent_ema,
+                        gaussians.material_dissent_observations,
+                        tau=opt.material_dissent_tau,
+                        min_gate=opt.material_dissent_min_gate,
+                        max_protected_fraction=opt.material_dissent_max_protected_fraction,
+                        min_observations=opt.material_dissent_min_observations,
+                    )
+                elif opt.material_dissent_gate_mode in ("soft", "soft_renorm"):
+                    gate, protected = gradient_dissent_soft_gate(
+                        gaussians.material_dissent_ema,
+                        gaussians.material_dissent_observations,
+                        tau=opt.material_dissent_tau,
+                        min_gate=opt.material_dissent_min_gate,
+                        min_observations=opt.material_dissent_min_observations,
+                        renormalize=(opt.material_dissent_gate_mode == "soft_renorm"),
+                        max_gate=opt.material_dissent_gate_max,
+                    )
+                else:
+                    raise ValueError(
+                        f"unknown material_dissent_gate_mode: {opt.material_dissent_gate_mode}"
+                    )
+
+            data_grads = tuple(
+                None if param.grad is None else param.grad.detach().clone()
+                for param in material_params
+            )
+            if collect:
+                lr_by_name = {group["name"]: group["lr"] for group in gaussians.optimizer.param_groups}
+                observation, material_stats = material_gradient_dissent_observation(
+                    data_grads, alignment_grads[:len(material_params)], visible,
+                    learning_rates=(lr_by_name["base_color"], lr_by_name["roughness"], lr_by_name["rotation"]),
+                    strength_percentile=opt.material_dissent_strength_percentile,
+                    min_pressure_ratio=opt.material_dissent_min_pressure_ratio,
+                )
+                gaussians.update_material_dissent_stats(
+                    observation, visible, opt.material_dissent_beta
+                )
+                tb_dict["material_dissent_score"] = material_stats["score_mean"]
+                tb_dict["material_dissent_conflict_frac"] = material_stats["conflict_fraction"]
+                tb_dict["material_dissent_strength_scale"] = material_stats["strength_scale"]
+
+            for parameter, alignment_grad in zip(material_params, alignment_grads[:len(material_params)]):
+                if alignment_grad is None:
+                    continue
+                row_gate = gate.view(gate.shape[0], *([1] * (alignment_grad.ndim - 1)))
+                gated_grad = alignment_grad * row_gate
+                if parameter.grad is None:
+                    parameter.grad = gated_grad.clone()
+                else:
+                    parameter.grad.add_(gated_grad)
+            # Preserve response-alignment's opacity/position/scale pathway for
+            # every surfel.  The experiment is deliberately a material-gradient
+            # dissent test, not an implicit geometry-freezing ablation.
+            for parameter, alignment_grad in zip(response_params[len(material_params):],
+                                                 alignment_grads[len(material_params):]):
+                if alignment_grad is None:
+                    continue
+                if parameter.grad is None:
+                    parameter.grad = alignment_grad.clone()
+                else:
+                    parameter.grad.add_(alignment_grad)
+            tb_dict["material_dissent_protected_frac"] = protected.float().mean()
+            tb_dict["material_dissent_gate"] = (
+                gate[protected].mean() if protected.any() else gate.new_tensor(1.0)
+            )
+        else:
+            total_loss.backward()
             
         iter_end.record()
 
@@ -301,6 +415,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Normal": f"{ema_normal_for_log:.{5}f}",
                     "Points": f"{gaussians.get_xyz.shape[0]}",
                     "Keff": f"{tb_dict.get('keff_mean', 0.0):.3f}",
+                    "AlignA": f"{float(tb_dict.get('loss_response_align_albedo', 0.0)):.4f}",
+                    "AlignR": f"{float(tb_dict.get('loss_response_align_roughness', 0.0)):.4f}",
+                    "AlignN": f"{float(tb_dict.get('loss_response_align_normal', 0.0)):.4f}",
+                    "MatProt": f"{float(tb_dict.get('material_dissent_protected_frac', 0.0)):.3f}",
                     "PSNR-train": f"{ema_psnr_for_log:.{4}f}",
                     "PSNR-test": f"{psnr_test:.{4}f}"
                 }

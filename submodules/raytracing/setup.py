@@ -115,7 +115,10 @@ pip install . # ditto but better (e.g., dependency & metadata handling)
 python setup.py develop # build extensions and install (symbolic) to PATH.
 pip install -e . # ditto but better (e.g., dependency & metadata handling)
 '''
-os.environ['TORCH_CUDA_ARCH_LIST'] = "7.5;8.6;8.9"
+# Keep the upstream multi-architecture default, but allow cluster/toolchain wrappers to target
+# newer GPUs (e.g. Blackwell sm_120).  Unconditionally overwriting this variable silently produced
+# an Ada-only extension even inside the dedicated radiogs_blackwell environment.
+os.environ.setdefault('TORCH_CUDA_ARCH_LIST', "7.5;8.6;8.9")
 setup(
     name='raytracing', # package name, import this to use python API
     version='0.1.0',

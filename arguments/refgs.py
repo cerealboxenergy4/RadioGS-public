@@ -96,6 +96,9 @@ class PipelineParams(ParamGroup):
         self.debug = False
         # single-layer: super-Gaussian footprint order for the rasterizer (2.0 == standard Gaussian)
         self.super_gaussian_order = 2.0
+        # Resume model parameters with a fresh optimizer so continuation runs
+        # honor the learning rates passed on the new command line.
+        self.restart = False
 
         # SRGB Transformation
         self.srgb = False
@@ -141,6 +144,39 @@ class OptimizationParams(ParamGroup):
         self.single_until_iter = 0          # 0 = hold to end (no decay)
         self.single_decay_iters = 0
         self.single_alpha_thresh = 0.5
+        # Confidence-aware selective ironing.  The confidence is detached and only redistributes
+        # the N_eff pressure over foreground pixels; its weighted mean keeps lambda_single's scale.
+        #   none     : original uniform foreground penalty (bit-exact legacy path)
+        #   edge     : protect GT image edges and uncertain silhouette pixels
+        #   geometry : protect depth-mixture / rendered-vs-depth-normal disagreement
+        #   hybrid   : geometric mean of edge + geometry confidence (recommended)
+        self.single_confidence_mode = "none"
+        self.single_confidence_edge_tau = 0.05
+        self.single_confidence_dist_scale = 1.0
+        self.single_confidence_normal_tau = 0.15
+        self.single_confidence_floor = 0.05
+        # Adaptive capacity routing.  `counterfactual` permits K*(x) in [1, 2] only when full
+        # compositing beats the first-hit render and the expected depth is geometrically separated
+        # from the first surface.  All routing evidence is detached.
+        self.single_layer_target_mode = "fixed"  # fixed | counterfactual
+        self.single_counterfactual_benefit_tau = 0.01
+        self.single_counterfactual_benefit_temperature = 0.005
+        self.single_counterfactual_depth_tau = 0.02
+        self.single_counterfactual_depth_temperature = 0.01
+        self.single_counterfactual_max_layers = 2.0
+        self.single_counterfactual_gate_mode = "soft"  # soft | hard
+
+        # Co-contributor normal alignment for the Stage-1 causal extension.
+        # D_n = 1 - ||sum_i w_i n_i / sum_i w_i||^2 is the weighted
+        # directional variance of normals intersected by a camera ray.
+        self.lambda_response_align_normal = 0.0
+        self.response_align_normal_warmup_iters = 0
+        self.response_align_normal_ramp_iters = 0
+        self.response_align_normal_until_iter = 0
+        self.response_align_normal_decay_iters = 0
+        self.response_align_normal_alpha_thresh = 0.9
+        self.response_align_normal_neff_thresh = 1.25
+        self.response_align_normal_flat_quantile = 0.5
         self.visibility_prune_interval = 0  # 0 = off
         self.visibility_prune_from_iter = 15_000
         self.visibility_prune_until_iter = 30_000
@@ -177,6 +213,29 @@ class OptimizationParams(ParamGroup):
         #     collapsing. Two-backward split (base retain_graph -> stash clean viewspace grad ->
         #     N_eff backward for the step) so densify sees only photometric/geometric gradient.
         self.decouple_single_grad = False
+        # Optimizer-revealed capacity routing. Compute the data and N_eff gradients separately;
+        # persistent opacity-gradient conflict earns a lagged, budgeted reduction of the complete
+        # per-surfel ironing gradient. Disabled by default for exact legacy behavior.
+        self.dissent_ironing = False
+        self.dissent_beta = 0.98
+        self.dissent_tau = 0.25
+        self.dissent_min_gate = 0.10
+        self.dissent_max_protected_fraction = 0.10
+        self.dissent_min_observations = 20
+        self.dissent_strength_percentile = 0.90
+        self.dissent_min_pressure_ratio = 0.25
+        self.dissent_gate_from_iter = 18_000
+        self.dissent_reset_margin = 200
+        # Continuous alternatives to the default budgeted top-k gate. ``soft``
+        # is pure relaxation; ``soft_renorm`` preserves mean consensus pressure
+        # by reallocating it onto low-dissent surfels.
+        self.dissent_gate_mode = "topk"
+        self.dissent_gate_max = 4.0
+        # Route the Stage-1 response-alignment loss through the dissent gate alongside the
+        # N_eff pressure (protected surfels shielded from both consensus pressures; the
+        # data-pressure observation excludes alignment). Off = alignment stays in the data
+        # objective, bit-exact with the ungated-alignment runs.
+        self.dissent_gate_alignment = False
         # (S) route clone candidates (small, high-grad surfels) through SPLIT instead of clone.
         #     Clone duplicates in place -> a coincident 2nd layer along the ray (N_eff spike the
         #     loss must then undo); split displaces children within the tangent plane (in-surface

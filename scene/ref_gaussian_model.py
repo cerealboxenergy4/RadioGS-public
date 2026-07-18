@@ -91,6 +91,8 @@ class RefGaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.radiosity_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.dissent_ema = torch.empty(0)
+        self.dissent_observations = torch.empty(0)
 
         self.optimizer = None
         self.percent_dense = 0
@@ -132,9 +134,20 @@ class RefGaussianModel:
             self.env_map_1.state_dict(),
             self.env_map_2.state_dict(),
             self.spatial_lr_scale,
+            {
+                "dissent_ema": self.dissent_ema,
+                "dissent_observations": self.dissent_observations,
+            },
         )
     
-    def restore(self, model_args, training_args=None):
+    def restore(self, model_args, training_args=None, restart=False):
+        dissent_state = None
+        if len(model_args) == 21:
+            dissent_state = model_args[-1]
+            model_args = model_args[:-1]
+        elif len(model_args) != 20:
+            raise ValueError("unexpected RefGaussianModel checkpoint tuple length: "
+                             + str(len(model_args)))
         (self.active_sh_degree, 
         self._xyz, 
         self._metallic, 
@@ -162,7 +175,16 @@ class RefGaussianModel:
             self.xyz_gradient_accum = xyz_gradient_accum
             self.radiosity_accum = radiosity_accum
             self.denom = denom
-            self.optimizer.load_state_dict(opt_dict)
+            if not restart:
+                self.optimizer.load_state_dict(opt_dict)
+            if dissent_state is not None:
+                ema = dissent_state.get("dissent_ema")
+                observations = dissent_state.get("dissent_observations")
+                if (ema is not None and observations is not None
+                        and ema.shape[0] == self.get_xyz.shape[0]
+                        and observations.shape[0] == self.get_xyz.shape[0]):
+                    self.dissent_ema = ema.to(device=self.get_xyz.device)
+                    self.dissent_observations = observations.to(device=self.get_xyz.device)
 
     def set_opacity_lr(self, lr):   
         for param_group in self.optimizer.param_groups:
@@ -315,6 +337,7 @@ class RefGaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.radiosity_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.reset_dissent_stats()
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -657,6 +680,33 @@ class RefGaussianModel:
         if getattr(self, "contribution_accum", torch.empty(0)).shape[0] == valid_points_mask.shape[0]:
             self.contribution_accum = self.contribution_accum[valid_points_mask]
             self.contribution_view_count = self.contribution_view_count[valid_points_mask]
+        if getattr(self, "dissent_ema", torch.empty(0)).shape[0] == valid_points_mask.shape[0]:
+            self.dissent_ema = self.dissent_ema[valid_points_mask]
+            self.dissent_observations = self.dissent_observations[valid_points_mask]
+
+    # ---- optimizer-revealed capacity routing state ----
+    def reset_dissent_stats(self):
+        n = self.get_xyz.shape[0]
+        self.dissent_ema = torch.zeros(n, device="cuda")
+        self.dissent_observations = torch.zeros(n, device="cuda")
+
+    def ensure_dissent_stats(self):
+        if getattr(self, "dissent_ema", torch.empty(0)).shape[0] != self.get_xyz.shape[0]:
+            self.reset_dissent_stats()
+
+    @torch.no_grad()
+    def update_dissent_stats(self, observation, visibility_filter, beta):
+        """Visibility-conditioned EMA: visible non-conflict is an explicit zero vote;
+        invisible surfels receive no update."""
+        self.ensure_dissent_stats()
+        visible = visibility_filter.detach().reshape(-1).bool()
+        if visible.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("dissent visibility mask lost primitive alignment")
+        beta = min(max(float(beta), 0.0), 0.999999)
+        obs = observation.detach().reshape(-1).to(self.dissent_ema)
+        self.dissent_ema[visible] = (beta * self.dissent_ema[visible]
+                                     + (1.0 - beta) * obs[visible])
+        self.dissent_observations[visible] += 1
 
     # ---- single-layer visibility prune (ported from single-layer-surfel Part 1) ----
     def reset_contribution_stats(self):
@@ -764,6 +814,9 @@ class RefGaussianModel:
         n = int(mask.sum())
         if n == 0:
             return 0
+        self.ensure_dissent_stats()
+        child_dissent = self.dissent_ema[mask].repeat(4)
+        child_observations = self.dissent_observations[mask].repeat(4)
         R = build_rotation(self._rotation[mask])
         s = self.get_scaling[mask]
         su = s[:, 0:1] * R[:, :, 0]
@@ -778,6 +831,8 @@ class RefGaussianModel:
                                    rep(self._features_rest), rep(self._indirect_dc),
                                    rep(self._indirect_rest), rep(self._opacity),
                                    new_scaling, rep(self._rotation))
+        self.dissent_ema[-4 * n:] = child_dissent
+        self.dissent_observations[-4 * n:] = child_observations
         prune_mask = torch.cat([mask, torch.zeros(4 * n, dtype=torch.bool, device=mask.device)])
         self.prune_points(prune_mask)
         return n
@@ -806,6 +861,7 @@ class RefGaussianModel:
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_metallic, new_roughness, new_base_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_rest, new_opacities, new_scaling, new_rotation):
+        old_dissent_n = getattr(self, "dissent_ema", torch.empty(0)).shape[0]
         d = {"xyz": new_xyz,
         "metallic": new_metallic,
         "roughness": new_roughness,
@@ -834,6 +890,14 @@ class RefGaussianModel:
         self.radiosity_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if old_dissent_n > 0 and old_dissent_n <= self.get_xyz.shape[0]:
+            added = self.get_xyz.shape[0] - old_dissent_n
+            self.dissent_ema = torch.cat(
+                [self.dissent_ema, torch.zeros(added, device=self.get_xyz.device)])
+            self.dissent_observations = torch.cat(
+                [self.dissent_observations, torch.zeros(added, device=self.get_xyz.device)])
+        else:
+            self.reset_dissent_stats()
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, alpha_preserving=False,
                           include_small=False):
@@ -847,6 +911,9 @@ class RefGaussianModel:
             # (S) include_small=True splits the clone candidates too (single-layer lateral refine).
             selected_pts_mask = torch.logical_and(selected_pts_mask,
                                                   torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        self.ensure_dissent_stats()
+        child_dissent = self.dissent_ema[selected_pts_mask].repeat(N)
+        child_observations = self.dissent_observations[selected_pts_mask].repeat(N)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
@@ -876,6 +943,10 @@ class RefGaussianModel:
             new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
         self.densification_postfix(new_xyz, new_metallic, new_roughness, new_base_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_rest, new_opacity, new_scaling, new_rotation)
+        n_children = int(selected_pts_mask.sum().item()) * N
+        if n_children > 0:
+            self.dissent_ema[-n_children:] = child_dissent
+            self.dissent_observations[-n_children:] = child_observations
 
         # single-layer: children inherit the parent's contribution stats (extend BEFORE the
         # parent prune below so prune_points slices an aligned array)
@@ -893,6 +964,9 @@ class RefGaussianModel:
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        self.ensure_dissent_stats()
+        child_dissent = self.dissent_ema[selected_pts_mask]
+        child_observations = self.dissent_observations[selected_pts_mask]
         
         new_xyz = self._xyz[selected_pts_mask]
 
@@ -918,6 +992,10 @@ class RefGaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_metallic, new_roughness, new_base_color, new_features_dc, new_features_rest, new_indirect_dc, new_indirect_rest, new_opacities, new_scaling, new_rotation)
+        n_children = int(selected_pts_mask.sum().item())
+        if n_children > 0:
+            self.dissent_ema[-n_children:] = child_dissent
+            self.dissent_observations[-n_children:] = child_observations
 
         # single-layer: cloned copies inherit the parent's contribution stats
         if getattr(self, "contribution_accum", torch.empty(0)).shape[0] == selected_pts_mask.shape[0]:
@@ -961,4 +1039,3 @@ class RefGaussianModel:
         vertices = np.asarray(mesh.vertices).astype(np.float32)
         faces = np.asarray(mesh.triangles).astype(np.int32)
         self.ray_tracer = raytracing.RayTracer(vertices, faces)
-        

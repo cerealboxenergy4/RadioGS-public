@@ -89,7 +89,9 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_contrib = torch::full({2, H, W}, 0.0, int_opts);	// //
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor out_feature = torch::full({S, H, W}, 0.0, float_opts);	// //
-  torch::Tensor out_others = torch::full({3+3+1+1, H, W}, 0.0, float_opts); // single-layer: +1 for M2_LAYER (N_eff)
+  // 8 legacy/geometry channels + first-hit alpha, premultiplied RGB, and depth.  The five
+  // counterfactual channels are forward-only; backward intentionally ignores their gradients.
+  torch::Tensor out_others = torch::full({13, H, W}, 0.0, float_opts);
   torch::Tensor surfel_contrib = torch::full({P}, 0.0, float_opts); // single-layer: per-Gaussian max contribution
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   

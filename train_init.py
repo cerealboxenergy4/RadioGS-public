@@ -12,12 +12,27 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import calculate_loss, l1_loss, calculate_loss2, calculate_loss4, scheduled_weight, single_layer_loss
+from utils.loss_utils import (calculate_loss, l1_loss, calculate_loss2, calculate_loss4,
+                             scheduled_weight, single_layer_confidence, single_layer_loss,
+                             counterfactual_layer_target, gradient_dissent_gate,
+                             gradient_dissent_observation, gradient_dissent_soft_gate,
+                             normal_response_alignment_loss)
 from gaussian_renderer import render_surfel, render_initial, render_volume
 import sys
 from scene import Scene, RefGaussianModel as GaussianModel
 from utils.general_utils import safe_state
 import numpy as np
+# numpy 2 -> 1 unpickle compat: checkpoints saved under numpy>=2 pickle classes as
+# numpy._core.*, which numpy 1.x names numpy.core.*. Alias the module paths so
+# cross-env resumes (pro6000/blackwell saves loaded on the L40 env) unpickle cleanly.
+if not hasattr(np, "_core"):
+    import numpy.core as _np_core
+    sys.modules.setdefault("numpy._core", _np_core)
+    for _sub in ("multiarray", "umath", "_multiarray_umath", "numeric",
+                 "numerictypes", "fromnumeric", "_dtype"):
+        _m = getattr(_np_core, _sub, None)
+        if _m is not None:
+            sys.modules.setdefault("numpy._core." + _sub, _m)
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
@@ -114,8 +129,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scene = Scene(dataset, gaussians)  # init all parameters(pos, scale, rot...) from pcds
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
+        gaussians.restore(model_params, opt, restart=pipe.restart)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -137,6 +152,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     # single-layer: last mask0 reset seen (gates the early contrib prune; on resume, treating
     # the resume point as a reset just delays the first prune by the margin)
     last_reset0_iter = first_iter
+    last_dissent_reset_iter = first_iter
     # on a resume past densify_until_iter the densify block (sole assigner) never
     # runs, so the mesh-extract gate would hit UnboundLocalError without this
     HAS_RESET0 = False
@@ -213,6 +229,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_image = viewpoint_cam.original_image.cuda()
 
         total_loss, tb_dict, radiosity_tensor = calculate_loss(viewpoint_cam, gaussians, render_pkg, opt, iteration)
+        normal_align_contrib, normal_align_stats = normal_response_alignment_loss(
+            viewpoint_cam, render_pkg, opt, iteration)
+        tb_dict.update(normal_align_stats)
+        if (iteration == max(first_iter, opt.response_align_normal_warmup_iters + 1)
+                and opt.lambda_response_align_normal > 0.0):
+            print(
+                "[normal-align] "
+                f"iter={iteration} D_n={float(normal_align_stats['loss_response_align_normal']):.6f} "
+                f"mask={float(normal_align_stats['response_align_normal_mask_frac']):.6f} "
+                f"N_eff={float(normal_align_stats['response_align_normal_neff']):.4f}",
+                flush=True,
+            )
         if radiosity_tensor is not None:
             with torch.no_grad():
                 # print("Radiosity stats - min:", radiosity.min().item(), "max:", radiosity.max().item(), "mean:", radiosity.mean().item(), "std:", radiosity.std().item())
@@ -232,20 +260,135 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # ---- single-layer ironing loss (N_eff) ----
         neff_for_log = 0.0
+        confidence_for_log = 1.0
+        target_for_log = 1.0
+        permit_for_log = 0.0
+        dissent_for_log = 0.0
+        conflict_for_log = 0.0
+        dissent_gate_for_log = 1.0
+        protected_for_log = 0.0
         neff_contrib = None
         if 'rend_alpha_m2' in render_pkg:
             single_w = scheduled_weight(opt.lambda_single, iteration, opt.single_warmup_iters,
                                         opt.single_ramp_iters, opt.single_until_iter, opt.single_decay_iters)
             if single_w > 0.0:
+                confidence = None
+                if opt.single_confidence_mode != "none":
+                    confidence, confidence_stats = single_layer_confidence(
+                        gt_image, render_pkg['rend_alpha'], render_pkg.get('rend_dist'),
+                        render_pkg.get('rend_normal'), render_pkg.get('surf_normal'),
+                        mode=opt.single_confidence_mode,
+                        alpha_threshold=opt.single_alpha_thresh,
+                        edge_tau=opt.single_confidence_edge_tau,
+                        dist_scale=opt.single_confidence_dist_scale,
+                        normal_tau=opt.single_confidence_normal_tau,
+                        confidence_floor=opt.single_confidence_floor)
+                    confidence_for_log = confidence_stats["mean"]
+                target = None
+                if opt.single_layer_target_mode == "counterfactual":
+                    required = ("rend_first_hit", "rend_first_depth", "rend_depth_expected")
+                    missing = [key for key in required if key not in render_pkg]
+                    if missing:
+                        raise RuntimeError("counterfactual layer target missing render outputs: "
+                                           + ", ".join(missing))
+                    target, target_stats = counterfactual_layer_target(
+                        gt_image, image, render_pkg["rend_first_hit"], render_pkg["rend_alpha"],
+                        render_pkg["rend_first_depth"], render_pkg["rend_depth_expected"],
+                        alpha_threshold=opt.single_alpha_thresh,
+                        benefit_tau=opt.single_counterfactual_benefit_tau,
+                        benefit_temperature=opt.single_counterfactual_benefit_temperature,
+                        depth_tau=opt.single_counterfactual_depth_tau,
+                        depth_temperature=opt.single_counterfactual_depth_temperature,
+                        max_layers=opt.single_counterfactual_max_layers,
+                        gate_mode=opt.single_counterfactual_gate_mode)
+                    target_for_log = target_stats["target_mean"]
+                    permit_for_log = target_stats["permit_fraction"]
+                elif opt.single_layer_target_mode != "fixed":
+                    raise ValueError("single_layer_target_mode must be fixed or counterfactual, got "
+                                     + repr(opt.single_layer_target_mode))
                 single_raw, neff_for_log, _ = single_layer_loss(
-                    render_pkg['rend_alpha'], render_pkg['rend_alpha_m2'], opt.single_alpha_thresh)
+                    render_pkg['rend_alpha'], render_pkg['rend_alpha_m2'], opt.single_alpha_thresh,
+                    confidence=confidence, target=target)
                 neff_contrib = single_w * single_raw
 
         # (G) decoupled backward: keep the N_eff gradient OUT of the densification accumulator.
         # Only worth splitting the backward while densification is still live (else the clean grad
         # is unused); outside that window fold N_eff back in for a single backward as before.
         clean_vs_grad = None
-        if (opt.decouple_single_grad and neff_contrib is not None
+        # Alignment is a consensus pressure like ironing. Default: it rides the data
+        # objective (ungated). With dissent_gate_alignment it joins the gated probe
+        # instead, so protected surfels are shielded from both homogenizers and the
+        # data-pressure observation stays free of alignment's reweighting channel.
+        align_gated = (opt.dissent_ironing and opt.dissent_gate_alignment
+                       and neff_contrib is not None)
+        if not align_gated:
+            total_loss = total_loss + normal_align_contrib
+        if opt.dissent_ironing and neff_contrib is not None:
+            # Probe the ungated N_eff gradient first, then backprop the data objective alone.
+            # autograd.grad does not write .grad, so the densification accumulator remains clean.
+            gated_params = (gaussians._xyz, gaussians._opacity,
+                            gaussians._scaling, gaussians._rotation)
+            probe_contrib = (neff_contrib + normal_align_contrib) if align_gated else neff_contrib
+            ironing_grads = torch.autograd.grad(
+                probe_contrib, gated_params, retain_graph=True, allow_unused=True)
+            total_loss.backward()
+            if viewspace_point_tensor.grad is not None:
+                clean_vs_grad = viewspace_point_tensor.grad.detach().clone()
+
+            gaussians.ensure_dissent_stats()
+            collect_dissent = (iteration - last_dissent_reset_iter
+                                >= opt.dissent_reset_margin)
+            apply_dissent = collect_dissent and iteration >= opt.dissent_gate_from_iter
+            gate = torch.ones(gaussians.get_xyz.shape[0], device="cuda")
+            protected = torch.zeros_like(gate, dtype=torch.bool)
+            if apply_dissent:
+                if opt.dissent_gate_mode == "topk":
+                    gate, protected = gradient_dissent_gate(
+                        gaussians.dissent_ema, gaussians.dissent_observations,
+                        tau=opt.dissent_tau, min_gate=opt.dissent_min_gate,
+                        max_protected_fraction=opt.dissent_max_protected_fraction,
+                        min_observations=opt.dissent_min_observations)
+                elif opt.dissent_gate_mode in ("soft", "soft_renorm"):
+                    gate, protected = gradient_dissent_soft_gate(
+                        gaussians.dissent_ema, gaussians.dissent_observations,
+                        tau=opt.dissent_tau, min_gate=opt.dissent_min_gate,
+                        min_observations=opt.dissent_min_observations,
+                        renormalize=(opt.dissent_gate_mode == "soft_renorm"),
+                        max_gate=opt.dissent_gate_max)
+                else:
+                    raise ValueError(f"unknown dissent_gate_mode: {opt.dissent_gate_mode}")
+
+            data_opacity_grad = (torch.zeros_like(gaussians._opacity)
+                                 if gaussians._opacity.grad is None
+                                 else gaussians._opacity.grad.detach().clone())
+            iron_opacity_grad = (torch.zeros_like(gaussians._opacity)
+                                 if ironing_grads[1] is None else ironing_grads[1])
+            if collect_dissent:
+                dissent_observation, dissent_stats = gradient_dissent_observation(
+                    data_opacity_grad, iron_opacity_grad, visibility_filter,
+                    strength_percentile=opt.dissent_strength_percentile,
+                    min_pressure_ratio=opt.dissent_min_pressure_ratio)
+                gaussians.update_dissent_stats(
+                    dissent_observation, visibility_filter, opt.dissent_beta)
+                dissent_for_log = dissent_stats["score_mean"]
+                conflict_for_log = dissent_stats["conflict_fraction"]
+
+            # Apply one-step-lagged protection to every geometric N_eff gradient row. The dissent
+            # signal itself uses opacity only, but a protected surfel must not collapse via scale or
+            # position as an alternative path.
+            for parameter, ironing_grad in zip(gated_params, ironing_grads):
+                if ironing_grad is None:
+                    continue
+                row_gate = gate.view(gate.shape[0], *([1] * (ironing_grad.ndim - 1)))
+                gated_grad = ironing_grad * row_gate
+                if parameter.grad is None:
+                    parameter.grad = gated_grad.clone()
+                else:
+                    parameter.grad.add_(gated_grad)
+            if protected.any():
+                dissent_gate_for_log = gate[protected].mean()
+            protected_for_log = protected.float().mean()
+        elif (opt.decouple_single_grad and neff_contrib is not None
                 and iteration < opt.densify_until_iter):
             total_loss.backward(retain_graph=True)  # photometric/geometric only
             if viewspace_point_tensor.grad is not None:
@@ -275,6 +418,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Normal": f"{ema_normal_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}",
                     "Neff": f"{float(neff_for_log):.3f}",
+                    "Ciron": f"{float(confidence_for_log):.3f}",
+                    "Ktarget": f"{float(target_for_log):.3f}",
+                    "K2permit": f"{float(permit_for_log):.3f}",
+                    "Dissent": f"{float(dissent_for_log):.3f}",
+                    "Dconf": f"{float(conflict_for_log):.3f}",
+                    "Dgate": f"{float(dissent_gate_for_log):.3f}",
+                    "Dprotect": f"{float(protected_for_log):.3f}",
+                    "AlignN": f"{float(tb_dict['loss_response_align_normal']):.4f}",
                     "PSNR-train": f"{ema_psnr_for_log:.{4}f}",
                     "PSNR-test": f"{psnr_test:.{4}f}"
                 }
@@ -339,6 +490,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration % opacity_reset_intval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     HAS_RESET0 = True
                     last_reset0_iter = iteration
+                    last_dissent_reset_iter = iteration
                     outside_msk = get_outside_msk()
                     dom_msk = (gaussians.get_dominant_mask(opt.dominance_reset_thresh)
                                if opt.dominance_reset_thresh > 0 and iteration >= opt.dominance_reset_from_iter
@@ -356,6 +508,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.set_opacity_lr(opt.opacity_lr)
                 if (opt.init_until_iter < iteration <= opt.normal_prop_until_iter ) and iteration % opt.normal_prop_interval == 0:
                     if not HAS_RESET0:
+                        last_dissent_reset_iter = iteration
                         outside_msk = get_outside_msk()
                         dom_msk = (gaussians.get_dominant_mask(opt.dominance_reset_thresh)
                                    if opt.dominance_reset_thresh > 0 and iteration >= opt.dominance_reset_from_iter

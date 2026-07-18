@@ -36,14 +36,314 @@ def scheduled_weight(target_weight, iteration, warmup_iters=0, ramp_iters=0, unt
     return weight * ramp
 
 
-def single_layer_loss(rend_alpha, rend_alpha_m2, alpha_threshold=0.5, eps=1e-8):
+@torch.no_grad()
+def gradient_dissent_observation(data_opacity_grad, ironing_opacity_grad, visible,
+                                 strength_percentile=0.90, min_pressure_ratio=0.25,
+                                 eps=1e-12):
+    """Measure per-surfel data-vs-ironing gradient conflict on opacity logits.
+
+    The score is nonzero only when the two objectives request opposite updates and the data
+    pressure is not negligible relative to the weighted ironing pressure. Magnitude is normalized
+    within the current visible set so the EMA remains comparable across cameras and phases.
+    Invisible surfels are returned as zero but must be excluded by the caller's EMA update.
+    """
+    data = data_opacity_grad.detach().reshape(-1)
+    iron = ironing_opacity_grad.detach().reshape(-1)
+    visible = visible.detach().reshape(-1).bool()
+    if data.shape != iron.shape or data.shape != visible.shape:
+        raise ValueError("gradient dissent inputs must have the same per-surfel length")
+
+    score = torch.zeros_like(data)
+    if not visible.any():
+        return score, {
+            "conflict_fraction": score.new_tensor(0.0),
+            "strength_scale": score.new_tensor(0.0),
+            "score_mean": score.new_tensor(0.0),
+        }
+
+    data_abs = data.abs()
+    iron_abs = iron.abs()
+    percentile = min(max(float(strength_percentile), 0.0), 1.0)
+    scale = torch.quantile(data_abs[visible].float(), percentile).to(data.dtype).clamp_min(eps)
+    conflict = ((data * iron < 0.0)
+                & (data_abs >= float(min_pressure_ratio) * iron_abs)
+                & (iron_abs > eps)
+                & visible)
+    score[conflict] = (data_abs[conflict] / scale).clamp(max=1.0)
+    return score, {
+        "conflict_fraction": conflict[visible].float().mean(),
+        "strength_scale": scale,
+        "score_mean": score[visible].mean(),
+    }
+
+
+@torch.no_grad()
+def gradient_dissent_gate(dissent_ema, observations, tau=0.25, min_gate=0.10,
+                          max_protected_fraction=0.10, min_observations=20):
+    """Turn lagged per-surfel dissent into a budgeted multiplier on ironing gradients."""
+    ema = dissent_ema.detach().reshape(-1)
+    observations = observations.detach().reshape(-1)
+    if ema.shape != observations.shape:
+        raise ValueError("dissent EMA and observation counts must have the same length")
+    gate = torch.ones_like(ema)
+    eligible = observations >= int(min_observations)
+    n_eligible = int(eligible.sum().item())
+    fraction = min(max(float(max_protected_fraction), 0.0), 1.0)
+    k = min(n_eligible, int(round(fraction * ema.numel())))
+    protected = torch.zeros_like(eligible)
+    if k > 0:
+        rank = ema.masked_fill(~eligible, -float("inf"))
+        protected[torch.topk(rank, k, sorted=False).indices] = True
+        floor = min(max(float(min_gate), 0.0), 1.0)
+        gate[protected] = floor + (1.0 - floor) * torch.exp(
+            -ema[protected] / max(float(tau), 1e-8))
+    return gate, protected
+
+
+@torch.no_grad()
+def gradient_dissent_soft_gate(dissent_ema, observations, tau=0.25, min_gate=0.0,
+                               min_observations=20, renormalize=False, max_gate=4.0):
+    """Continuously price dissent instead of selecting a top-k subset.
+
+    Every sufficiently observed surfel receives ``exp(-EMA / tau)`` consensus
+    pressure.  ``renormalize`` restores unit mean pressure (up to
+    ``max_gate``), reallocating the reduction from conflicted surfels to
+    compliant ones; without it the gate is the intentionally pure relaxation.
+    """
+    ema = dissent_ema.detach().reshape(-1)
+    observations = observations.detach().reshape(-1)
+    if ema.shape != observations.shape:
+        raise ValueError("dissent EMA and observation counts must have the same length")
+    eligible = observations >= int(min_observations)
+    floor = min(max(float(min_gate), 0.0), 1.0)
+    gate = torch.ones_like(ema)
+    gate[eligible] = floor + (1.0 - floor) * torch.exp(
+        -ema[eligible] / max(float(tau), 1e-8))
+    if renormalize and gate.numel():
+        gate = gate / gate.mean().clamp_min(1e-8)
+        gate = gate.clamp(max=float(max_gate))
+    return gate, eligible & (gate < 1.0)
+
+
+@torch.no_grad()
+def material_gradient_dissent_observation(data_grads, alignment_grads, visible,
+                                          learning_rates=None, strength_percentile=0.90,
+                                          min_pressure_ratio=0.25, eps=1e-12):
+    """Measure data-vs-response-alignment conflict per surfel in Stage 2.
+
+    Unlike :func:`gradient_dissent_observation`, which intentionally observes
+    the scalar opacity direction used by Stage-1 N_eff ironing, this function
+    combines row gradients for the PBR attributes (base colour, roughness and
+    orientation).  Each row is first converted to its optimizer-step scale,
+    so the comparison reflects the update that would actually be applied even
+    when the attributes use different learning rates.
+
+    ``data_grads`` must come from the reconstruction objective *without* the
+    response-alignment term.  ``alignment_grads`` comes from that term alone.
+    A surfel dissents only when their aggregate step directions oppose and the
+    reconstruction pressure is non-negligible relative to alignment pressure.
+    """
+    if len(data_grads) != len(alignment_grads):
+        raise ValueError("data and alignment gradient lists must have the same length")
+    if learning_rates is None:
+        learning_rates = [1.0] * len(data_grads)
+    if len(learning_rates) != len(data_grads):
+        raise ValueError("learning_rates must align with the gradient lists")
+
+    visible = visible.detach().reshape(-1).bool()
+    n = visible.numel()
+    device = visible.device
+    dtype = torch.float32
+    data_sq = torch.zeros(n, device=device, dtype=dtype)
+    align_sq = torch.zeros_like(data_sq)
+    dot = torch.zeros_like(data_sq)
+
+    for data_grad, align_grad, lr in zip(data_grads, alignment_grads, learning_rates):
+        if data_grad is None and align_grad is None:
+            continue
+        template = data_grad if data_grad is not None else align_grad
+        if template.shape[0] != n:
+            raise ValueError("material dissent gradient lost primitive alignment")
+        if data_grad is None:
+            data_grad = torch.zeros_like(template)
+        if align_grad is None:
+            align_grad = torch.zeros_like(template)
+        data = data_grad.detach().reshape(n, -1).float() * float(lr)
+        align = align_grad.detach().reshape(n, -1).float() * float(lr)
+        data_sq.add_(data.square().sum(dim=1))
+        align_sq.add_(align.square().sum(dim=1))
+        dot.add_((data * align).sum(dim=1))
+
+    score = torch.zeros_like(data_sq)
+    if not visible.any():
+        return score, {
+            "conflict_fraction": score.new_tensor(0.0),
+            "strength_scale": score.new_tensor(0.0),
+            "score_mean": score.new_tensor(0.0),
+        }
+
+    data_norm = data_sq.sqrt()
+    align_norm = align_sq.sqrt()
+    percentile = min(max(float(strength_percentile), 0.0), 1.0)
+    scale = torch.quantile(data_norm[visible], percentile).clamp_min(eps)
+    conflict = ((dot < 0.0)
+                & (data_norm >= float(min_pressure_ratio) * align_norm)
+                & (align_norm > eps)
+                & visible)
+    score[conflict] = (data_norm[conflict] / scale).clamp(max=1.0)
+    return score, {
+        "conflict_fraction": conflict[visible].float().mean(),
+        "strength_scale": scale,
+        "score_mean": score[visible].mean(),
+    }
+
+
+@torch.no_grad()
+def single_layer_confidence(gt_image, rend_alpha, rend_dist=None, rend_normal=None,
+                            surf_normal=None, mode="hybrid", alpha_threshold=0.5,
+                            edge_tau=0.05, dist_scale=1.0, normal_tau=0.15,
+                            confidence_floor=0.05, eps=1e-8):
+    """Detached confidence map for selective camera-ray ironing.
+
+    Uniform N_eff pressure is least trustworthy at high-frequency appearance edges, silhouettes,
+    mixed-depth pixels, and pixels where the accumulated surfel normal disagrees with the
+    depth-derived surface normal.  This map protects those locations while retaining pressure on
+    smooth, geometrically coherent surface interiors.  The caller uses a confidence-normalized
+    weighted mean, so this redistributes (rather than merely weakens) ``lambda_single``.
+    """
+    mode = str(mode).lower()
+    valid_modes = {"none", "edge", "geometry", "hybrid"}
+    if mode not in valid_modes:
+        raise ValueError("single_confidence_mode must be one of %s, got %r" %
+                         (sorted(valid_modes), mode))
+
+    alpha = rend_alpha.detach()
+    foreground = alpha > alpha_threshold
+    one = torch.ones_like(alpha)
+    if mode == "none" or not foreground.any():
+        return one, {"mean": one[foreground].mean() if foreground.any() else one.mean()}
+
+    # Soft interior confidence: pixels just over the foreground cutoff are typically silhouettes
+    # or partial-coverage pixels, where forcing an exact single layer is ill-conditioned.
+    alpha_span = max(1.0 - float(alpha_threshold), eps)
+    q_silhouette = ((alpha - float(alpha_threshold)) / alpha_span).clamp(0.0, 1.0)
+    components = [q_silhouette]
+    stats = {"silhouette": q_silhouette[foreground].mean()}
+
+    if mode in {"edge", "hybrid"}:
+        # GT-derived confidence cannot be gamed by the renderer.  Luma Sobel magnitude is in the
+        # native [0,1] image range; edge_tau controls the protected-detail bandwidth.
+        image = gt_image.detach().clamp(0.0, 1.0)
+        luma = (0.299 * image[0:1] + 0.587 * image[1:2] + 0.114 * image[2:3])
+        grad = spatial_gradient(luma[None], order=1, normalized=True)[0, 0]
+        grad_mag = torch.sqrt(grad.square().sum(dim=0, keepdim=True) + eps)
+        q_edge = torch.exp(-grad_mag / max(float(edge_tau), eps))
+        components.append(q_edge)
+        stats["edge"] = q_edge[foreground].mean()
+
+    if mode in {"geometry", "hybrid"}:
+        if rend_dist is None or rend_normal is None or surf_normal is None:
+            raise ValueError("geometry/hybrid confidence requires rend_dist, rend_normal, surf_normal")
+
+        # 2DGS distortion directly measures multi-depth mixing.  Normalize by the current view's
+        # foreground mean so one scale works across scenes and camera distances.
+        distortion = rend_dist.detach().clamp_min(0.0)
+        dist_ref = distortion[foreground].mean().clamp_min(eps)
+        q_dist = torch.exp(-distortion / (dist_ref * max(float(dist_scale), eps)))
+
+        rn = F.normalize(rend_normal.detach(), dim=0, eps=eps)
+        sn = F.normalize(surf_normal.detach(), dim=0, eps=eps)
+        normal_disagreement = (1.0 - (rn * sn).sum(dim=0, keepdim=True).clamp(-1.0, 1.0))
+        q_normal = torch.exp(-normal_disagreement / max(float(normal_tau), eps))
+        components.extend([q_dist, q_normal])
+        stats["dist"] = q_dist[foreground].mean()
+        stats["normal"] = q_normal[foreground].mean()
+
+    # Geometric mean avoids one noisy cue annihilating the others.  A small floor retains a weak
+    # anti-stacking signal even at protected pixels and makes the weighted mean numerically robust.
+    confidence = torch.ones_like(alpha)
+    for component in components:
+        confidence = confidence * component.clamp_min(eps)
+    confidence = confidence.pow(1.0 / len(components))
+    floor = min(max(float(confidence_floor), 0.0), 1.0)
+    confidence = floor + (1.0 - floor) * confidence
+    confidence = confidence.detach()
+    stats["mean"] = confidence[foreground].mean()
+    return confidence, stats
+
+
+def counterfactual_layer_target(gt_image, full_image, first_hit_image, rend_alpha,
+                                first_hit_depth, expected_depth, alpha_threshold=0.5,
+                                benefit_tau=0.01, benefit_temperature=0.005,
+                                depth_tau=0.02, depth_temperature=0.01,
+                                max_layers=2.0, gate_mode="soft", eps=1e-8):
+    """Detached adaptive layer target derived from appearance necessity and depth separation.
+
+    A second layer is permitted only where full compositing improves per-pixel RGB L1 over the
+    first accepted surfel *and* moves the expected depth away from that first surface.  The depth
+    condition prevents texture/material edges at one depth from buying capacity through a stack.
+    This is deliberately a local prototype: multi-view persistence and top-2 tail mass are left to
+    the next routing stage once the counterfactual signal itself is shown to be useful.
+    """
+    with torch.no_grad():
+        first_error = (first_hit_image.detach() - gt_image.detach()).abs().mean(dim=0, keepdim=True)
+        full_error = (full_image.detach() - gt_image.detach()).abs().mean(dim=0, keepdim=True)
+        benefit = first_error - full_error
+        benefit_gate = torch.sigmoid(
+            (benefit - float(benefit_tau)) / max(float(benefit_temperature), eps))
+
+        first_depth = first_hit_depth.detach()
+        expected = expected_depth.detach()
+        relative_depth_gap = (expected - first_depth).abs() / first_depth.abs().clamp_min(eps)
+        depth_gate = torch.sigmoid(
+            (relative_depth_gap - float(depth_tau)) / max(float(depth_temperature), eps))
+
+        foreground = rend_alpha.detach() > alpha_threshold
+        if gate_mode == "soft":
+            gate = benefit_gate * depth_gate
+        elif gate_mode == "hard":
+            # Routing evidence is detached, so the discontinuous decision cannot be gamed by
+            # gradients. This arm directly tests a literal K=1-or-2 capacity exception.
+            gate = ((benefit > float(benefit_tau))
+                    & (relative_depth_gap > float(depth_tau))).to(benefit_gate.dtype)
+        else:
+            raise ValueError("gate_mode must be soft or hard, got " + repr(gate_mode))
+        gate = gate * foreground.to(benefit_gate.dtype)
+        max_layers = min(max(float(max_layers), 1.0), 2.0)
+        target = 1.0 + (max_layers - 1.0) * gate
+        stats = {
+            "target_mean": target[foreground].mean() if foreground.any() else target.new_tensor(1.0),
+            "permit_fraction": (gate[foreground] > 0.5).float().mean()
+            if foreground.any() else gate.new_tensor(0.0),
+            "benefit_mean": benefit[foreground].mean()
+            if foreground.any() else benefit.new_tensor(0.0),
+            "depth_gap_mean": relative_depth_gap[foreground].mean()
+            if foreground.any() else relative_depth_gap.new_tensor(0.0),
+        }
+    return target.detach(), stats
+
+
+def single_layer_loss(rend_alpha, rend_alpha_m2, alpha_threshold=0.5, confidence=None,
+                      target=None, eps=1e-8):
     """Transmittance-weighted effective layer count N_eff = alpha^2 / sum(w_i^2); penalize (N_eff - 1)
-    on foreground pixels. Drives the surfel shell toward a single layer per camera ray."""
+    on foreground pixels.  An optional detached confidence map selectively redistributes the loss
+    while preserving its weighted-mean scale. Drives the surfel shell toward one layer per ray."""
     neff = rend_alpha.square() / rend_alpha_m2.clamp_min(eps)
     foreground = rend_alpha > alpha_threshold
     if foreground.any():
         values = neff[foreground]
-        return (values - 1.0).clamp_min(0.0).mean(), values.detach().mean(), foreground.float().mean()
+        if target is None:
+            targets = 1.0
+        else:
+            targets = target.detach().to(device=values.device, dtype=values.dtype)[foreground]
+        penalty = (values - targets).clamp_min(0.0)
+        if confidence is None:
+            loss = penalty.mean()
+        else:
+            weights = confidence.detach().to(device=penalty.device, dtype=penalty.dtype)[foreground]
+            weights = weights.clamp_min(0.0)
+            loss = (weights * penalty).sum() / weights.sum().clamp_min(eps)
+        return loss, values.detach().mean(), foreground.float().mean()
     zero = rend_alpha.sum() * 0.0
     return zero, zero.detach(), zero.detach()
 
@@ -74,6 +374,151 @@ def alpha_binary_loss(trace_alpha, alpha_threshold=0.5):
         return (a * (1.0 - a)).mean(), a.detach().mean(), foreground.float().mean()
     zero = trace_alpha.sum() * 0.0
     return zero, zero.detach(), zero.detach()
+
+
+def response_alignment_loss(viewpoint_camera, render_pkg, opt, iteration):
+    """Align PBR attributes only where co-contributing surfels plausibly
+    describe the same opaque, locally flat surface.
+
+    The mask excludes silhouettes and true image discontinuities. Stage-2
+    geometry uses its standard small ``lr_scale``, allowing normals to adapt
+    gradually while material and geometry co-evolve.
+    """
+    albedo_weight = scheduled_weight(
+        opt.lambda_response_align_albedo,
+        iteration,
+        opt.response_align_warmup_iters,
+        opt.response_align_ramp_iters,
+        opt.response_align_until_iter,
+        opt.response_align_decay_iters,
+    )
+    roughness_weight = scheduled_weight(
+        opt.lambda_response_align_roughness,
+        iteration,
+        opt.response_align_warmup_iters,
+        opt.response_align_ramp_iters,
+        opt.response_align_until_iter,
+        opt.response_align_decay_iters,
+    )
+    normal_weight = scheduled_weight(
+        opt.lambda_response_align_normal,
+        iteration,
+        opt.response_align_warmup_iters,
+        opt.response_align_ramp_iters,
+        opt.response_align_until_iter,
+        opt.response_align_decay_iters,
+    )
+
+    zero = render_pkg["rend_alpha"].sum() * 0.0
+    if albedo_weight <= 0.0 and roughness_weight <= 0.0 and normal_weight <= 0.0:
+        return zero, {
+            "loss_response_align_albedo": zero.detach(),
+            "loss_response_align_roughness": zero.detach(),
+            "loss_response_align_normal": zero.detach(),
+            "response_align_mask_frac": zero.detach(),
+            "response_align_neff": zero.detach(),
+        }
+
+    alpha = render_pkg["rend_alpha"]
+    neff = render_pkg["rend_neff"]
+    mask = (alpha.detach() > opt.response_align_alpha_thresh) & \
+           (neff.detach() > opt.response_align_neff_thresh)
+
+    if viewpoint_camera.mask is not None:
+        mask = mask & (viewpoint_camera.mask.float().cuda() > 0.5)
+
+    flat_quantile = float(opt.response_align_flat_quantile)
+    if 0.0 < flat_quantile < 1.0 and mask.any():
+        gt = viewpoint_camera.original_image.cuda()
+        gt_grad = spatial_gradient(gt.unsqueeze(0), normalized=False).abs().mean(dim=(1, 2))
+        eligible = mask[0]
+        threshold = torch.quantile(gt_grad[0][eligible].detach(), flat_quantile)
+        mask = mask & (gt_grad <= threshold)
+
+    if not mask.any():
+        return zero, {
+            "loss_response_align_albedo": zero.detach(),
+            "loss_response_align_roughness": zero.detach(),
+            "loss_response_align_normal": zero.detach(),
+            "response_align_mask_frac": mask.float().mean(),
+            "response_align_neff": zero.detach(),
+        }
+
+    loss_albedo = render_pkg["response_var_albedo"][mask].mean()
+    loss_roughness = render_pkg["response_var_roughness"][mask].mean()
+    loss_normal = render_pkg["response_var_normal"][mask].mean()
+    loss = (albedo_weight * loss_albedo + roughness_weight * loss_roughness
+            + normal_weight * loss_normal)
+    stats = {
+        "loss_response_align_albedo": loss_albedo.detach(),
+        "loss_response_align_roughness": loss_roughness.detach(),
+        "loss_response_align_normal": loss_normal.detach(),
+        "response_align_mask_frac": mask.float().mean().detach(),
+        "response_align_neff": neff[mask].mean().detach(),
+        "response_align_weight_albedo": albedo_weight,
+        "response_align_weight_roughness": roughness_weight,
+        "response_align_weight_normal": normal_weight,
+    }
+    return loss, stats
+
+
+def normal_response_alignment_loss(viewpoint_camera, render_pkg, opt, iteration, eps=1e-8):
+    """Penalize directional variance among surfel normals on one camera ray.
+
+    ``rend_normal`` is ``sum_i w_i n_i`` and ``rend_alpha`` is ``sum_i w_i``.
+    For unit normals, ``1 - ||rend_normal / rend_alpha||^2`` is the weighted
+    directional variance. Opaque, multi-contributor, locally flat pixels keep
+    the objective away from silhouettes and genuine discontinuities.
+    """
+    weight = scheduled_weight(
+        opt.lambda_response_align_normal,
+        iteration,
+        opt.response_align_normal_warmup_iters,
+        opt.response_align_normal_ramp_iters,
+        opt.response_align_normal_until_iter,
+        opt.response_align_normal_decay_iters,
+    )
+    alpha = render_pkg["rend_alpha"]
+    zero = alpha.sum() * 0.0
+    empty = {
+        "loss_response_align_normal": zero.detach(),
+        "response_align_normal_mask_frac": zero.detach(),
+        "response_align_normal_neff": zero.detach(),
+        "response_align_normal_weight": weight,
+    }
+    if weight <= 0.0:
+        return zero, empty
+
+    neff = alpha.square() / render_pkg["rend_alpha_m2"].clamp_min(eps)
+    mask = (alpha.detach() > opt.response_align_normal_alpha_thresh) & \
+           (neff.detach() > opt.response_align_normal_neff_thresh)
+    if viewpoint_camera.mask is not None:
+        mask = mask & (viewpoint_camera.mask.float().cuda() > 0.5)
+
+    flat_quantile = float(opt.response_align_normal_flat_quantile)
+    if 0.0 < flat_quantile < 1.0 and mask.any():
+        gt = viewpoint_camera.original_image.cuda()
+        gt_grad = spatial_gradient(gt.unsqueeze(0), normalized=False).abs().mean(dim=(1, 2))
+        eligible = mask[0]
+        threshold = torch.quantile(gt_grad[0][eligible].detach(), flat_quantile)
+        mask = mask & (gt_grad <= threshold)
+
+    if not mask.any():
+        empty["response_align_normal_mask_frac"] = mask.float().mean().detach()
+        return zero, empty
+
+    mean_normal = render_pkg["rend_normal"] / alpha.clamp_min(eps)
+    directional_variance = (1.0 - mean_normal.square().sum(dim=0, keepdim=True)).clamp_min(0.0)
+    loss_normal = directional_variance[mask].mean()
+    stats = {
+        "loss_response_align_normal": loss_normal.detach(),
+        "response_align_normal_mask_frac": mask.float().mean().detach(),
+        "response_align_normal_neff": neff[mask].mean().detach(),
+        "response_align_normal_weight": weight,
+    }
+    return weight * loss_normal, stats
+
+
 from utils.graphics_utils import rgb_to_srgb, srgb_to_rgb
 
 def cos_loss(output, gt, thrsh=0, weight=1):
@@ -445,6 +890,15 @@ def calculate_loss3(viewpoint_camera, pc, render_pkg, opt, iteration):
     rendered_image_sh = render_pkg["render_sh"]
     loss_sh = (1.0 - opt.lambda_dssim) * l1_loss(rendered_image_sh, gt_image) + opt.lambda_dssim * (1.0 - ssim(rendered_image_sh, gt_image))
     loss += loss_sh * opt.lambda_nvs
+
+    response_loss, response_stats = response_alignment_loss(
+        viewpoint_camera, render_pkg, opt, iteration
+    )
+    loss = loss + response_loss
+    tb_dict.update(response_stats)
+    # Kept differentiable for Stage-2 material-dissent gradient surgery.  The
+    # training loop removes this private entry before TensorBoard logging.
+    tb_dict["_response_align_contrib"] = response_loss
 
     with torch.no_grad():
         rendered_image = render_pkg["render"]

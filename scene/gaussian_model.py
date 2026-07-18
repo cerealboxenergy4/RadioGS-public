@@ -206,6 +206,10 @@ class GaussianModel:
             self.optimizer.load_state_dict(opt_dict)
 
     def restore_from_refgs(self, model_args, training_args=None):
+        # RefGaussianModel may append optimizer-revealed ironing statistics. Stage 2 only needs
+        # the original geometric/material payload.
+        if len(model_args) == 21 and isinstance(model_args[-1], dict):
+            model_args = model_args[:-1]
         
         if len(model_args) == 26:
             (self.active_sh_degree, 

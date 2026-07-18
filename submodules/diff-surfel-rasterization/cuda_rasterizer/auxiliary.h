@@ -27,6 +27,9 @@
 #define MIDDEPTH_OFFSET 5
 #define DISTORTION_OFFSET 6
 #define M2_LAYER_OFFSET 7          // single-layer: second moment of compositing weights (sum w_i^2) -> N_eff
+#define FIRST_ALPHA_OFFSET 8       // counterfactual routing: first accepted surfel alpha
+#define FIRST_COLOR_OFFSET 9       // counterfactual routing: premultiplied first-hit RGB (9..11)
+#define FIRST_DEPTH_OFFSET 12      // counterfactual routing: first accepted surfel depth
 // #define MEDIAN_WEIGHT_OFFSET 8
 
 // ---- Single-layer / super-Gaussian footprint helpers (ported from single-layer-surfel 2DGS) ----

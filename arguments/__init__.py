@@ -239,6 +239,36 @@ class OptimizationParams(ParamGroup):
         self.lambda_base_color_smooth = 0.0
         self.lambda_roughness_smooth = 0.0
         self.lambda_metallic_smooth = 0.0
+        # Per-camera-ray response alignment.  The renderer emits first/second
+        # moments of the co-contributing surfels' PBR attributes; these losses
+        # minimize their weighted variance while Stage-2 geometry is frozen.
+        self.lambda_response_align_albedo = 0.0
+        self.lambda_response_align_roughness = 0.0
+        self.lambda_response_align_normal = 0.0
+        self.response_align_warmup_iters = 0
+        self.response_align_ramp_iters = 0
+        self.response_align_until_iter = 0
+        self.response_align_decay_iters = 0
+        self.response_align_alpha_thresh = 0.9
+        self.response_align_neff_thresh = 1.25
+        self.response_align_flat_quantile = 0.5
+        # Optimizer-revealed selective response alignment (Stage 2).  After a
+        # stabilization period, persistent conflict between reconstruction and
+        # response-alignment gradients protects only the relevant PBR surfels
+        # from the consensus term; reconstruction remains fully active.
+        self.material_dissent_alignment = False
+        self.material_dissent_collect_from_iter = 0
+        self.material_dissent_gate_from_iter = 0
+        self.material_dissent_beta = 0.98
+        self.material_dissent_tau = 0.25
+        self.material_dissent_min_gate = 0.10
+        self.material_dissent_max_protected_fraction = 0.10
+        self.material_dissent_min_observations = 20
+        self.material_dissent_strength_percentile = 0.90
+        self.material_dissent_min_pressure_ratio = 0.25
+        # Match Stage-1's gate family for the Stage-2 material-alignment term.
+        self.material_dissent_gate_mode = "topk"
+        self.material_dissent_gate_max = 4.0
         self.lambda_light = 0.0
         self.lambda_light_smooth = 0.0
 

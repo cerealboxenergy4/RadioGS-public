@@ -323,6 +323,10 @@ renderCUDA(
 	float M1 = {0};
 	float M2 = {0};
 	float alpha_m2 = {0}; // single-layer: sum of squared compositing weights
+	bool first_hit_set = false;
+	float first_alpha = {0};
+	float first_color[3] = {0};
+	float first_depth = {0};
 	float distortion = {0};
 	float median_depth = {0};
 	float median_contributor = {-1};
@@ -398,6 +402,16 @@ renderCUDA(
 
 			float w = alpha * T;
 #if RENDER_AXUTILITY
+			// Detached counterfactual channels: render the first accepted surfel alone.  They are
+			// forward-only evidence for deciding whether a second layer genuinely helps; gradients
+			// still flow exclusively through the existing full render and alpha-moment channels.
+			if (!first_hit_set) {
+				first_hit_set = true;
+				first_alpha = alpha;
+				first_depth = depth;
+				for (int ch = 0; ch < 3; ch++)
+					first_color[ch] = colors[collected_id[j] * CHANNELS + ch] * alpha;
+			}
 			alpha_m2 += w * w; // single-layer: accumulate sum w_i^2
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
@@ -454,6 +468,10 @@ renderCUDA(
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = D2;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
 		out_others[pix_id + M2_LAYER_OFFSET * H * W] = alpha_m2; // single-layer: sum w_i^2 -> N_eff
+		out_others[pix_id + FIRST_ALPHA_OFFSET * H * W] = first_alpha;
+		for (int ch = 0; ch < 3; ch++)
+			out_others[pix_id + (FIRST_COLOR_OFFSET + ch) * H * W] = first_color[ch];
+		out_others[pix_id + FIRST_DEPTH_OFFSET * H * W] = first_depth;
 #endif
 	}
 }

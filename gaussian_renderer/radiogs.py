@@ -128,7 +128,10 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
     if base_color_scale is not None:
         base_color = base_color * base_color_scale[None, :]
 
-    features = torch.cat([base_color, roughness], dim=-1)
+    # Response-alignment moments.  The rasterizer composites every feature with
+    # the exact same front-to-back weights as RGB, so rendering x and x^2 gives
+    # Var_p[x] = E_p[x^2] - E_p[x]^2 without storing per-pixel hit lists.
+    features = torch.cat([base_color, roughness, base_color.square(), roughness.square()], dim=-1)
 
     if pipe.bf_random:
         shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
@@ -200,7 +203,22 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
     normal_map = normal_map / render_alpha.permute(1,2,0).clamp_min(1e-6)  
     normal_map = F.normalize(normal_map, dim=-1)
 
-    rendered_base_color, rendered_roughness = rendered_features.split([3, 1], dim=0)
+    rendered_base_color, rendered_roughness, rendered_base_color_m2, rendered_roughness_m2 = \
+        rendered_features.split([3, 1, 3, 1], dim=0)
+
+    alpha_safe = render_alpha.clamp_min(1e-8)
+    mean_base_color = rendered_base_color / alpha_safe
+    mean_roughness = rendered_roughness / alpha_safe
+    response_var_albedo = (
+        rendered_base_color_m2 / alpha_safe - mean_base_color.square()
+    ).sum(dim=0, keepdim=True).clamp_min(0.0)
+    response_var_roughness = (
+        rendered_roughness_m2 / alpha_safe - mean_roughness.square()
+    ).clamp_min(0.0)
+    mean_normal = render_normal / alpha_safe
+    response_var_normal = (1.0 - mean_normal.square().sum(dim=0, keepdim=True)).clamp_min(0.0)
+    rend_alpha_m2 = allmap[7:8]
+    rend_neff = render_alpha.square() / rend_alpha_m2.clamp_min(1e-8)
 
     def opacity_filter(r, m, b):
         return r * m.detach() + b * (1 - m.detach())
@@ -220,7 +238,12 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
             "visibility_filter" : radii > 0,
             "radii": radii,
             'rend_alpha': render_alpha,
+            'rend_alpha_m2': rend_alpha_m2,
+            'rend_neff': rend_neff,
             'rend_normal': rend_normal,
+            'response_var_albedo': response_var_albedo,
+            'response_var_roughness': response_var_roughness,
+            'response_var_normal': response_var_normal,
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
@@ -567,7 +590,12 @@ def render_radiogs(viewpoint_camera, pc : RadioGSModel, pipe, bg_color : torch.T
         "visibility_filter" : radii > 0,
         "radii": radii,
         'rend_alpha': render_alpha,
+        'rend_alpha_m2': rend_alpha_m2,
+        'rend_neff': rend_neff,
         'rend_normal': rend_normal,
+        'response_var_albedo': response_var_albedo,
+        'response_var_roughness': response_var_roughness,
+        'response_var_normal': response_var_normal,
         'rend_dist': render_dist,
         'surf_depth': surf_depth,
         'surf_normal': surf_normal,

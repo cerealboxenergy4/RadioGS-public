@@ -137,6 +137,12 @@ class GaussianModel:
         # cache), swapped in for the composited local_incident_lights when pipe.first_hit_pbr.
         self._first_hit_pbr_ind = None      # [N,S,3], detached
         self._incident_hit_idx = None       # [N,S] first-hit surfel per incident ray (from precompute_incidents)
+
+        # Stage-2 PBR-attribute dissent state.  Kept distinct from RefGS's
+        # Stage-1 N_eff dissent because its evidence is material-gradient
+        # conflict rather than opacity-gradient conflict.
+        self.material_dissent_ema = torch.empty(0)
+        self.material_dissent_observations = torch.empty(0)
         
     @torch.no_grad()
     def set_transform(self, rotation=None, center=None, scale=None, offset=None, transform=None):
@@ -200,9 +206,19 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.env_map.capture(),
             self.spatial_lr_scale,
+            {
+                "material_dissent_ema": self.material_dissent_ema,
+                "material_dissent_observations": self.material_dissent_observations,
+            },
         )
     
     def restore(self, model_args, training_args=None, restart=False):
+        material_dissent_state = None
+        if len(model_args) == 17 and isinstance(model_args[-1], dict):
+            material_dissent_state = model_args[-1]
+            model_args = model_args[:-1]
+        elif len(model_args) != 16:
+            raise ValueError("unexpected RadioGSModel checkpoint tuple length: " + str(len(model_args)))
         (self.active_sh_degree, 
         self._xyz, 
         self._metallic, 
@@ -225,8 +241,43 @@ class GaussianModel:
             self.xyz_gradient_accum = xyz_gradient_accum
             self.denom = denom
             if not restart: self.optimizer.load_state_dict(opt_dict)
+            if material_dissent_state is not None:
+                ema = material_dissent_state.get("material_dissent_ema")
+                observations = material_dissent_state.get("material_dissent_observations")
+                if (ema is not None and observations is not None
+                        and ema.shape[0] == self.get_xyz.shape[0]
+                        and observations.shape[0] == self.get_xyz.shape[0]):
+                    self.material_dissent_ema = ema.to(device=self.get_xyz.device)
+                    self.material_dissent_observations = observations.to(device=self.get_xyz.device)
+
+    # ---- Stage-2 optimizer-revealed material-alignment state ----
+    def reset_material_dissent_stats(self):
+        n = self.get_xyz.shape[0]
+        self.material_dissent_ema = torch.zeros(n, device=self.get_xyz.device)
+        self.material_dissent_observations = torch.zeros(n, device=self.get_xyz.device)
+
+    def ensure_material_dissent_stats(self):
+        if getattr(self, "material_dissent_ema", torch.empty(0)).shape[0] != self.get_xyz.shape[0]:
+            self.reset_material_dissent_stats()
+
+    @torch.no_grad()
+    def update_material_dissent_stats(self, observation, visibility_filter, beta):
+        self.ensure_material_dissent_stats()
+        visible = visibility_filter.detach().reshape(-1).bool()
+        if visible.shape[0] != self.get_xyz.shape[0]:
+            raise ValueError("material dissent visibility mask lost primitive alignment")
+        beta = min(max(float(beta), 0.0), 0.999999)
+        obs = observation.detach().reshape(-1).to(self.material_dissent_ema)
+        self.material_dissent_ema[visible] = (
+            beta * self.material_dissent_ema[visible] + (1.0 - beta) * obs[visible]
+        )
+        self.material_dissent_observations[visible] += 1
 
     def restore_from_refgs(self, model_args, training_args=None):
+        # RefGaussianModel may append optimizer-revealed ironing statistics. Stage 2 only needs
+        # the original geometric/material payload.
+        if len(model_args) == 21 and isinstance(model_args[-1], dict):
+            model_args = model_args[:-1]
         
         if len(model_args) == 26:
             (self.active_sh_degree, 
