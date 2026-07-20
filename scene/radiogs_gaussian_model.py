@@ -567,7 +567,7 @@ class GaussianModel:
 
         map_path = path.replace('.ply', '1.map')
         if os.path.exists(map_path):
-            map_ckpt = torch.load(map_path)
+            map_ckpt = torch.load(map_path, weights_only=False)
             self.env_map = EnvLight(path=None, device='cuda', resolution=map_ckpt['state_dict']['base'].shape[:2]).cuda()
             self.env_map.restore(map_ckpt)
 

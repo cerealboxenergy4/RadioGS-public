@@ -569,13 +569,13 @@ class RefGaussianModel:
 
         map_path1 = path.replace('.ply', '_1.map')
         if os.path.exists(map_path1):
-            map_ckpt = torch.load(map_path1)
+            map_ckpt = torch.load(map_path1, weights_only=False)
             self.env_map_1 = EnvLightMip(path=None, device='cuda', max_res=map_ckpt['base'].shape[1], activation=envmap_activation).cuda()
             self.env_map_1.load_state_dict(map_ckpt)
 
         map_path2 = path.replace('.ply', '_2.map')
         if os.path.exists(map_path2):
-            map_ckpt = torch.load(map_path2)
+            map_ckpt = torch.load(map_path2, weights_only=False)
             self.env_map_2 = EnvLightMip(path=None, device='cuda', max_res=map_ckpt['base'].shape[1], activation=envmap_activation).cuda()
             self.env_map_2.load_state_dict(map_ckpt)
             
